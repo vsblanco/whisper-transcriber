@@ -1,0 +1,25 @@
+# Transcripts and media stay out of the repo
+Transcripts/
+*_transcript.txt
+*.srt
+*.vtt
+*.wav
+*.mp4
+*.mkv
+*.mov
+*.mp3
+*.m4a
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+.~lock.*

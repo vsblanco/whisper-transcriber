@@ -1,0 +1,2 @@
+openai-whisper>=20240930
+tkinterdnd2>=0.4.2   # drag and drop in the app (optional)
