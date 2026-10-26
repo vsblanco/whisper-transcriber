@@ -16,7 +16,8 @@ if "%~1"=="" (
 )
 
 cd /d "%~dp0"
-python "%~dp0transcribe_video.py" %* --model medium
+rem Uses Python 3.12 (where Whisper is installed). Change -3.12 if yours is a different version.
+py -3.12 "%~dp0transcribe_video.py" %* --model medium
 
 if %ERRORLEVEL% NEQ 0 (
     echo.

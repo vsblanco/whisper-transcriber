@@ -1,2 +1,8 @@
 openai-whisper>=20240930
+sv-ttk>=2.6          # Windows 11 style light/dark theme
+pillow>=10           # profile pictures
 tkinterdnd2>=0.4.2   # drag and drop in the app (optional)
+python-vlc>=3.0      # video preview (optional; also needs VLC media player installed)
+# Speaker detection (optional): pip install pyannote.audio   and a Hugging Face token (see README)
+# Recording voice samples in People (optional): pip install soundcard
+# About 4x faster transcription (optional): pip install faster-whisper

@@ -13,9 +13,14 @@ import sys
 from pathlib import Path
 
 from transcriber.core import (
-    MODELS, WRITERS, Segment, check_ffmpeg, default_output_dir, format_timestamp,
-    save_transcript, transcribe_file,
+    MODELS,
+    Segment,
+    check_ffmpeg,
+    default_output_dir,
+    format_timestamp,
+    transcribe_file,
 )
+from transcriber.files import WRITERS, save_transcript
 
 
 def main() -> int:

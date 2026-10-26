@@ -23,3 +23,8 @@ venv/
 Thumbs.db
 desktop.ini
 .~lock.*
+.pytest_cache/
+*_speakers.json
+*_words.json
+*_session.json
+*_markers.json
