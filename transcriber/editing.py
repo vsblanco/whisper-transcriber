@@ -138,6 +138,12 @@ class EditingMixin:
             self._resume_edit = (meta["key"], offset)
         self._editing = None
         self._row_meta = {}
+        # Take the rows' marks out BEFORE the text is cleared and redrawn. Deleting the text leaves
+        # every mark piled up at the start, and Tk then wades through that pile on each insert: with
+        # a few thousand rows, a redraw went from a quarter of a second to minutes.
+        t = self.text
+        for m in [m for m in t.mark_names() if m.startswith("b") and m[1:-1].isdigit()]:
+            t.mark_unset(m)
 
     def _edit_text_for(self, meta) -> str:
         fkey = self._file_key(meta["files"])
@@ -159,8 +165,6 @@ class EditingMixin:
     def _edit_after_render(self, rows: dict):
         """rows = {line: (meta, col0, col1)} for the editable rows just drawn."""
         t = self.text
-        for m in [m for m in t.mark_names() if m.startswith("b") and m[1:-1].isdigit()]:
-            t.mark_unset(m)
         resume = None
         for line, (meta, c0, c1) in rows.items():
             t.mark_set(f"b{line}s", f"{line}.{c0}")
@@ -179,6 +183,7 @@ class EditingMixin:
         if resume:
             line, offset = resume
             self.after_idle(lambda: self._start_edit(line, f"b{line}s + {offset} chars"))
+        self._applied = dict(self._edits)             # what the rows show now
 
     @staticmethod
     def _file_key(files: dict) -> str:
@@ -189,6 +194,12 @@ class EditingMixin:
     def _on_text_double(self, e):
         idx = self.text.index(f"@{e.x},{e.y}")
         line = int(idx.split(".")[0])
+        if "tsend" in self.text.tag_names(f"{line}.0"):          # a folded paragraph's second line
+            line -= 1
+        info = getattr(self, "_group_lines", {}).get(line)
+        if info and not info["open"] and "who" not in self.text.tag_names(idx):
+            self._toggle_paragraph(line, True)       # a folded paragraph opens into its lines
+            return "break"
         if line not in self._row_meta or "who" in self.text.tag_names(idx):
             return None
         if "ts" in self.text.tag_names(idx):
@@ -214,20 +225,30 @@ class EditingMixin:
             sec = sec * 60 + x
         return sec
 
+    def _ts_len(self, line: int) -> int:
+        """How many characters the row's timestamp has, inside its brackets."""
+        import re
+        m = re.match(r"\[([0-9:.]+)\]", self.text.get(f"{line}.0", f"{line}.20"))
+        return len(m[1]) if m else 8
+
     def _time_key(self, meta):
         return meta["key"] + ("t",)
 
+    def _layer_key(self, meta):
+        """The pending-edit key for a line's caption spot (the timeline's stacking)."""
+        return meta["key"] + ("layer",)
+
     def _shown_time(self, meta) -> float:
-        return self._edits.get(self._time_key(meta), meta.get("sec", 0.0))
+        t = self._edits.get(self._time_key(meta), meta.get("sec", 0.0))
+        return t[0] if isinstance(t, (tuple, list)) else t     # (start, end) from the timeline
 
     def _show_time(self, line: int):
         """Put a row's current time (edited or not) into its timestamp, highlighted if changed."""
-        from transcriber.core import format_timestamp
         meta, t = self._row_meta.get(line), self.text
         if not meta or "sec" not in meta:
             return
-        new = format_timestamp(self._shown_time(meta))
-        a, b = f"{line}.1", f"{line}.9"
+        new = self._ts(self._shown_time(meta))
+        a, b = f"{line}.1", f"{line}.{1 + self._ts_len(line)}"
         if t.get(a, b) != new:
             state = t.cget("state")
             t.configure(state="normal")
@@ -246,17 +267,18 @@ class EditingMixin:
         self._end_time_edit(commit=False)
         t = self.text
         box = t.bbox(f"{line}.0")
-        end = t.bbox(f"{line}.9")
+        end = t.bbox(f"{line}.{1 + self._ts_len(line)}")
         if not box or not end:
             return
         x, y, _w, h = box
-        width = end[0] + end[2] - x - 6
+        width = max(end[0] + end[2] - x - 6, int(t.tk.call("font", "measure", ("Consolas", 9), "00:00:00.000")) + 4)
         p = self._palette()
         entry = tk.Entry(t, font=("Consolas", 9), relief="flat", borderwidth=0, highlightthickness=1,
                          background=p["bg"], foreground=p["fg"], insertbackground=p["fg"],
                          highlightcolor=self._edit_colors()["acc"], highlightbackground=self._edit_colors()["acc"],
                          justify="center")
-        entry.insert(0, t.get(f"{line}.1", f"{line}.9"))
+        from transcriber.core import format_timestamp
+        entry.insert(0, format_timestamp(self._shown_time(meta), millis=True, sep="."))     # (exact, to the ms)
         entry.place(x=x, y=y - 1, width=width + 6, height=h + 2)
         entry.select_range(0, "end")
         entry.focus_set()
@@ -284,8 +306,11 @@ class EditingMixin:
             return
         new = dict(self._edits)
         key = self._time_key(meta)
-        if int(sec) == int(meta["sec"]) and abs(sec - meta["sec"]) < 1:
+        old = new.get(key)
+        if abs(sec - float(meta["sec"])) < 0.0005 and not isinstance(old, (tuple, list)):
             new.pop(key, None)
+        elif isinstance(old, (tuple, list)):             # set on the timeline: keep its length
+            new[key] = (sec, sec + (old[1] - old[0]))
         else:
             new[key] = sec
         if new != self._edits:
@@ -295,6 +320,8 @@ class EditingMixin:
     def _start_edit(self, line: int, index: str):
         if line not in self._row_meta or self._is_deleted(self._row_meta[line]):
             return
+        if hasattr(self, "_show_tab"):
+            self._show_tab("transcript")           # (started from the timeline or the video)
         if self._editing != line:
             self._end_edit()
         t = self.text
@@ -318,6 +345,9 @@ class EditingMixin:
         self._editing = None
         t.configure(state="disabled", cursor="")
         self.focus_set()
+        if getattr(self, "_typing_job", None) is not None:      # the edit is done: catch up now
+            self.after_cancel(self._typing_job)
+            self._after_typing()
 
     def _clamp_insert(self):
         line = self._editing
@@ -451,6 +481,12 @@ class EditingMixin:
         self._highlight(line)
         if new == self._edits:
             return
+        applied = getattr(self, "_applied", None)
+        if applied is not None:                        # this row shows the typed text already
+            if meta["key"] in new:
+                applied[meta["key"]] = new[meta["key"]]
+            else:
+                applied.pop(meta["key"], None)
         self._push_state(new, coalesce_key=meta["key"], text=cur)
 
     def _push_state(self, new: dict, coalesce_key=None, text: str = ""):
@@ -501,13 +537,23 @@ class EditingMixin:
                 a = j1 if j1 < len(cur) else j1 - 1
                 t.tag_add("edited", f"{s} + {a} chars", f"{s} + {a + 1} chars")
 
-    def _apply_edit_state(self, state: dict):
-        """Show a history state: put each visible row's text back to what that state says."""
+    def _apply_edit_state(self, state: dict, full: bool = False):
+        """Show a history state: put each visible row's text back to what that state says. Only the
+        rows whose edits differ from the current state are touched (thousands of rows, one change);
+        full: every row."""
         t = self.text
         editing = self._editing
+        shown = getattr(self, "_applied", None)      # the state the rows were last drawn or edited to
         self._edits = dict(state)
+        if full or shown is None:
+            rows = list(self._row_meta.items())
+        else:
+            missing = object()
+            changed = {k[:2] for k in set(shown) | set(self._edits) if shown.get(k, missing) != self._edits.get(k, missing)}
+            rows = [(line, meta) for line, meta in self._row_meta.items() if meta["key"] in changed]
+        self._applied = dict(self._edits)
         t.configure(state="normal")
-        for line, meta in self._row_meta.items():
+        for line, meta in rows:
             want = self._edits.get(meta["key"], meta["orig"])
             if want is None:
                 want = meta["orig"]
@@ -578,20 +624,26 @@ class EditingMixin:
         return "break"
 
     def _split_row(self, line: int, left: str, right: str, start=None, keep_pending=False, then_edit=False):
+        self._split_meta(self._row_meta[line], left, right, start, keep_pending, then_edit)
+
+    def _split_meta(self, meta, left: str, right: str, start=None, keep_pending=False, then_edit=False,
+                    new_start=None, end=None):
+        """Split a line in two (saved right away; Ctrl+Z undoes it). new_start/end: exact times
+        (the timeline's snip tool), otherwise worked out from the words."""
         from pathlib import Path
         from transcriber.edits import split_line
         from transcriber.speakers import rows_for
-        meta = self._row_meta[line]
         files, i, fkey = meta["files"], meta["i"], meta["fkey"]
         if start is None:
             start = self._shown_time(meta)
-        rows = rows_for(files, self.people)
-        new_start = start + 1.0                       # the second half starts a second later...
-        if i + 1 < len(rows) and rows[i + 1][0] <= new_start:
-            new_start = start + max((rows[i + 1][0] - start) / 2, 0)   # ...or halfway to the next line
-        word_time = self._word_split_time(meta, left, right)
-        if word_time is not None and right:
-            new_start = word_time + (start - meta.get("sec", start))     # exactly when that word was said
+        if new_start is None:
+            rows = rows_for(files, self.people)
+            new_start = start + 1.0                       # the second half starts a second later...
+            if i + 1 < len(rows) and rows[i + 1][0] <= new_start:
+                new_start = start + max((rows[i + 1][0] - start) / 2, 0)   # ...or halfway to the next line
+            word_time = self._word_split_time(meta, left, right)
+            if word_time is not None and right:
+                new_start = word_time + (start - meta.get("sec", start))     # exactly when that word was said
         self._end_edit()
         snapshot = {}
         for f in files.values():
@@ -612,7 +664,7 @@ class EditingMixin:
         try:
             if hasattr(self, "_backup"):
                 self._backup(files)
-            split_line(files, i, left, right, start, new_start, self.people)
+            split_line(files, i, left, right, start, new_start, self.people, end=end)
         except Exception as exc:
             messagebox.showerror("Couldn't split the line", str(exc))
             return
@@ -628,6 +680,42 @@ class EditingMixin:
             if then_edit and line:
                 self._start_edit(line, f"b{line}s")
         self.after(120, after)
+
+    def _insert_line(self, files, fkey, start: float, end: float, text: str, speaker=None) -> bool:
+        """Add a line to a version (the timeline's paste). Saved right away; Ctrl+Z takes it out."""
+        from pathlib import Path
+        from transcriber.edits import insert_line
+        from transcriber.speakers import rows_for
+        self._end_edit()
+        snapshot = {}
+        for f in files.values():
+            try:
+                snapshot[str(f)] = Path(f).read_text(encoding="utf-8")
+            except OSError:
+                pass
+        i = next((k for k, r in enumerate(rows_for(files, self.people)) if r[0] > start), None)
+        record = {"snapshot": snapshot, "edits": dict(self._edits), "hist": list(self._hist),
+                  "hist_i": self._hist_i, "where": (fkey, i or 0)}
+        try:
+            if hasattr(self, "_backup"):
+                self._backup(files)
+            k = insert_line(files, start, end, text, speaker, self.people)
+        except Exception as exc:
+            messagebox.showerror("Couldn't paste the line", str(exc))
+            return False
+        if k is None:
+            return False
+        new = {}                                     # pending changes to later lines move down one
+        for key, value in self._edits.items():
+            if key[0] == fkey and key[1] >= k:
+                key = (key[0], key[1] + 1) + key[2:]
+            new[key] = value
+        self._split_undo.append(record)
+        self._edits, self._hist, self._hist_i = new, [new], 0
+        self._update_edit_bar()
+        self._refresh_saved(force=True)
+        self._redisplay()
+        return True
 
     def _word_split_time(self, meta, left: str, right: str):
         """When the first word of the right half was said, if the line's word timings still fit."""
@@ -652,7 +740,7 @@ class EditingMixin:
                 failed.append(f"{Path(path).name}: {exc}")
         self._edits, self._hist, self._hist_i = record["edits"], record["hist"], record["hist_i"]
         self._update_edit_bar()
-        self.status_var.set("Couldn't fully undo the split: " + "; ".join(failed) if failed else "Split undone.")
+        self.status_var.set("Couldn't fully undo it: " + "; ".join(failed) if failed else "Undone.")
         self._refresh_saved(force=True)
         self._redisplay()
         self.after(120, lambda: self._hover_key(record["where"]))
@@ -687,10 +775,13 @@ class EditingMixin:
         if not self._edits:
             return True
         by_file: dict[str, tuple] = {}
+        layers_by_file: dict[str, dict] = {}
         for key, value in self._edits.items():
             fkey, i = key[0], key[1]
             edits, deletes, times = by_file.setdefault(fkey, ({}, set(), {}))
-            if len(key) > 2:
+            if len(key) > 2 and key[2] == "layer":
+                layers_by_file.setdefault(fkey, {})[i] = value
+            elif len(key) > 2:
                 times[i] = value
             elif value is None:
                 deletes.add(i)
@@ -703,6 +794,9 @@ class EditingMixin:
             try:
                 if hasattr(self, "_backup"):
                     self._backup(self._edit_files[fkey], stamp)
+                if layers_by_file.get(fkey):
+                    from transcriber.edits import set_layers
+                    set_layers(self._edit_files[fkey], layers_by_file[fkey], self.people)
                 apply_text_edits(self._edit_files[fkey], edits, self.people, deletes, times)
             except Exception as exc:
                 failed.append(f"{Path(fkey).name}: {exc}")
@@ -755,15 +849,27 @@ class EditingMixin:
     # ------------------------------------------------------------ the bar
 
     def _change_summary(self) -> str:
-        timed = sum(1 for k in self._edits if len(k) > 2)
+        stacked = sum(1 for k in self._edits if len(k) > 2 and k[2] == "layer")
+        timed = sum(1 for k in self._edits if len(k) > 2) - stacked
         edited = sum(1 for k, v in self._edits.items() if len(k) == 2 and v is not None)
-        deleted = len(self._edits) - edited - timed
+        deleted = len(self._edits) - edited - timed - stacked
         parts = ([f"{edited} line{'s' if edited != 1 else ''} edited"] if edited else []) + \
                 ([f"{timed} time{'s' if timed != 1 else ''} changed"] if timed else []) + \
+                ([f"{stacked} caption{'s' if stacked != 1 else ''} stacked"] if stacked else []) + \
                 ([f"{deleted} line{'s' if deleted != 1 else ''} deleted"] if deleted else [])
         return " \u00b7 ".join(parts)
 
     def _update_edit_bar(self):
+        if hasattr(self, "_timeline_refresh"):
+            # The timeline and the player's captions follow edits. While typing, they catch up once
+            # the typing pauses (rebuilding them on every letter is what made typing stutter).
+            if self._editing is not None:
+                if getattr(self, "_typing_job", None) is not None:
+                    self.after_cancel(self._typing_job)
+                self._typing_job = self.after(350, self._after_typing)
+            else:
+                self._timeline_refresh()
+                self._refresh_preview_caps()
         n = len(self._edits)
         self._bar_count.configure(text=self._change_summary())
         if n and not self._bar_shown:
@@ -777,6 +883,13 @@ class EditingMixin:
             self.edit_bar.pack_forget()
         elif self._bar_shown:
             self._paint_edit_bar(1.0)
+
+    def _after_typing(self):
+        """Typing paused (or the edit ended): the timeline and the player's captions catch up."""
+        self._typing_job = None
+        if hasattr(self, "_timeline_refresh"):
+            self._timeline_refresh(now=True)
+            self._refresh_preview_caps(now=True)
 
     def _fade(self, step: int, steps: int = 9):
         self._paint_edit_bar(step / steps)

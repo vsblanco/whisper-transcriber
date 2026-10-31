@@ -21,9 +21,12 @@ import threading
 from pathlib import Path
 from typing import Optional
 import tkinter as tk
+from tkinter import ttk
 
 from transcriber.core import AUDIO_EXTENSIONS, write_text_safe
 from transcriber.fonts import ui_font
+from transcriber.icons import info_icon
+from transcriber.ui_common import set_dark_titlebar
 
 COLORS = {"you": "#4c8dff", "claude": "#d97757"}      # yours: blue; Claude's: orange
 TINTS = {"light": {"you": "#dbe7ff", "claude": "#f8dfd4"}, "dark": {"you": "#1f3355", "claude": "#4a2c22"}}
@@ -98,7 +101,7 @@ class MarkersMixin:
             self._marker_rows.setdefault(line, m)
             who = "claude" if m.get("by") == "claude" else "you"
             t.tag_add(f"mark_{who}", f"{line}.0", f"{line}.0 lineend +1c")
-            if m.get("end"):
+            if m.get("end") and line in self._row_meta:
                 self._show_range(m, line, who)
         self._markers_theme()
 
@@ -143,7 +146,9 @@ class MarkersMixin:
         it falls in (the last one starting at or before it)."""
         t = float(m.get("time", -1))
         best, best_sec = None, None
-        for line, meta in self._row_meta.items():
+        candidates = list(self._row_meta.items()) + [(gl, meta) for gl, info in getattr(self, "_group_lines", {}).items()
+                                                     if not info["open"] for meta in info["metas"]]
+        for line, meta in candidates:
             if m.get("track") and meta.get("track") and m["track"] != meta["track"]:
                 continue
             sec = float(meta.get("sec", -99))
@@ -285,14 +290,109 @@ class MarkersMixin:
                             command=lambda: self._export_markers("resolve", 1))
         resolve.add_command(label="Timeline starts at 00:00:00:00", command=lambda: self._export_markers("resolve", 0))
         menu.add_command(label="DaVinci Resolve: audio + markers + captions", command=lambda: self._export_markers("resolve_all"))
+        menu.add_command(label="DaVinci Resolve: send captions to the open timeline...", command=self._send_to_resolve_dialog)
         menu.add_cascade(label="DaVinci Resolve: markers only (.edl)", menu=resolve)
         menu.add_command(label="Final Cut Pro (.fcpxml)", command=lambda: self._export_markers("fcp"))
         menu.add_command(label="Premiere Pro (.xml)", command=lambda: self._export_markers("premiere"))
+        menu.add_separator()
+        menu.add_command(label="Video with captions (subtitle track)...", command=self._save_with_captions)
+        menu.add_command(label="Cut video: only the marked parts, or without deleted lines...", command=self._cut_dialog)
+        menu.add_separator()
+        menu.add_command(label="Check captions (reading speed, timing, loops)...", command=self._check_captions)
         b = self.export_btn
         try:
             menu.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
         finally:
             menu.grab_release()
+
+    def _send_to_resolve_dialog(self):
+        """Captions straight onto the timeline open in DaVinci Resolve: as a subtitle track, or as
+        Text+ titles in each person's color."""
+        if not getattr(self, "display", None) or self.display[0] != "saved":
+            self.status_var.set("Pick a transcript first.")
+            return
+        win = tk.Toplevel(self)
+        win.title("Send to DaVinci Resolve")
+        win.transient(self)
+        win.resizable(False, False)
+        f = ttk.Frame(win, padding=(22, 18))
+        f.pack(fill="both", expand=True)
+        head = ttk.Frame(f)
+        head.pack(anchor="w", pady=(0, 10))
+        ttk.Label(head, text="Send captions to DaVinci Resolve", font=ui_font(12, bold=True)).pack(side="left")
+        info_icon(head, self, "Puts the captions on the timeline that's open in Resolve, through Resolve's own "
+                              "scripting. Resolve must be open with that timeline on the Edit page, and "
+                              "Preferences > System > General > External scripting using must be Local.").pack(side="left", padx=6)
+        how = tk.StringVar(value="text")
+        ttk.Radiobutton(f, text="Text+ titles, one per caption, in each person's color", value="text", variable=how).pack(anchor="w")
+        ttk.Label(f, text="Needs a Text+ in Resolve's media pool (drag Text+ from Effects > Titles into it, and style "
+                          "it the way the captions should look). They go on a new video track.",
+                  style="Muted.TLabel", wraplength=420, justify="left").pack(anchor="w", padx=(22, 0))
+        ttk.Radiobutton(f, text="Subtitle track (Resolve's own captions)", value="track", variable=how).pack(anchor="w", pady=(8, 0))
+        ttk.Label(f, text="One style for all, set in the Inspector. Works without any setup.",
+                  style="Muted.TLabel", wraplength=420, justify="left").pack(anchor="w", padx=(22, 0))
+        colors_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="Each person's color on their captions (Text+ only)", variable=colors_var).pack(anchor="w", pady=(10, 0))
+        status = ttk.Label(f, text="", style="Muted.TLabel", wraplength=420, justify="left")
+        status.pack(anchor="w", pady=(8, 0))
+        buttons = ttk.Frame(f)
+        buttons.pack(fill="x", pady=(14, 0))
+
+        def go():
+            plan = self._caption_plan()
+            source = (self._shown_item() or {}).get("source")
+            language = self._transcript_language()
+            win.destroy()
+            self._send_to_resolve(how.get(), plan, source, language, bool(colors_var.get()))
+
+        ttk.Button(buttons, text="Send", style="Accent.TButton", command=go).pack(side="right")
+        ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side="right", padx=(0, 8))
+        win.bind("<Return>", lambda e: go())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_reqwidth()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - win.winfo_reqheight()) // 3
+        win.geometry(f"+{x}+{y}")
+        set_dark_titlebar(win, self.current_theme == "dark")
+        win.grab_set()
+
+    def _send_to_resolve(self, how: str, plan: list, source, language: str, colors: bool):
+        import tempfile
+        import threading
+        from transcriber import resolve_bridge as rb
+        from transcriber.captions import to_srt
+        self.status_var.set("Lining the captions up with the voice...")
+        self._busy(True, "Sending to Resolve")
+
+        def say(msg):
+            self.events.put(("call", lambda: self.status_var.set(msg)))
+
+        def work():
+            msg = ""
+            try:
+                cues = self.caption_cues(plan, source)
+                if not cues:
+                    raise rb.ResolveError("This transcript has no lines to send.")
+                say("Talking to DaVinci Resolve...")
+                info = rb.open_timeline(rb.connect())
+                if how == "track":
+                    tmp = tempfile.mkdtemp(prefix="wt_resolve_")
+                    srt = Path(tmp, "captions.srt")
+                    srt.write_text(to_srt(cues), encoding="utf-8")
+                    rb.send_subtitle_track(info, str(srt))
+                    msg = f"Captions are on “{info['name']}” in Resolve as a subtitle track ({len(cues)} captions)."
+                else:
+                    r = rb.send_text_plus(info, cues, colors=colors, size=None, progress=say)
+                    msg = (f"{r['placed']} Text+ captions are on “{info['name']}” in Resolve (video track {r['track']})."
+                           + ("" if r["styled"] == r["placed"] else
+                              f" {r['placed'] - r['styled']} couldn't be styled: the media pool clip isn't a Text+."))
+            except rb.ResolveError as exc:
+                msg = str(exc)
+            except Exception as exc:
+                msg = f"Couldn't send to Resolve: {exc}"
+            self.events.put(("call", lambda: (self._busy(False), self.status_var.set(msg))))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _export_markers(self, kind: str, start_hour: int = 1):
         from tkinter import filedialog
@@ -357,16 +457,17 @@ class MarkersMixin:
                 here = os.path.exists(source)
                 fps = mx.frame_rate(source if here else None)
                 video = has_video_stream(source) if here else Path(source).suffix.lower() not in AUDIO_EXTENSIONS
-                caps = self.captions_between(self.timed_captions(plan), 0.0, 10 ** 7)
+                caps = self.caption_cues(plan, source if (here and video) else None)
                 duration = (media_duration(source) if here else None) or max(
-                    [float(m.get("end") or m.get("time", 0)) for m in markers] + [c[1] for c in caps] + [0]) + 5
+                    [float(m.get("end") or m.get("time", 0)) for m in markers] + [c.end for c in caps] + [0]) + 5
                 Path(out).write_text(mx.to_fcpxml(markers, title, source, fps, duration, video), encoding="utf-8",
                                      newline="")
                 # Resolve doesn't always show markers that come inside the timeline file, so they also go
                 # in an EDL it reads as timeline markers (same timeline start: 00:00:00:00).
                 edl.write_text(mx.to_edl(markers, title, fps, 0), encoding="utf-8", newline="")
                 if caps:
-                    srt.write_text(self._srt(caps), encoding="utf-8")
+                    from transcriber.captions import to_srt
+                    srt.write_text(to_srt(caps), encoding="utf-8")
             except OSError as exc:
                 err = str(exc)
             self.events.put(("call", lambda: (self._busy(False), self._resolve_exported(out, edl, srt, caps, source, err))))

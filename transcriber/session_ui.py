@@ -119,9 +119,10 @@ class SessionMixin:
         opts.grid(row=4 + len(paths), column=0, columnspan=5, sticky="w", pady=(12, 0))
         xtalk = tk.BooleanVar(value=True)
         ttk.Checkbutton(opts, text="Remove crosstalk", variable=xtalk).pack(side="left")
-        info_icon(opts, self, "Mics pick up the people nearby. A line is dropped from someone's mic when another "
-                              "person's mic was clearly louder at that moment, so each line appears once, under "
-                              "the right person.").pack(side="left", padx=4)
+        info_icon(opts, self, "Mics pick up the people nearby, so the same words get caught by several mics. "
+                              "When two mics have the same words at the same moment, only the closest mic's line "
+                              "is kept (compared with each mic's own usual level, so a mic set louder doesn't "
+                              "win by volume). Lines only one mic has are always kept.").pack(side="left", padx=4)
         status = ttk.Label(frame, text="Lining up the recordings...", style="Muted.TLabel")
         status.grid(row=5 + len(paths), column=0, columnspan=5, sticky="w", pady=(8, 0))
         info_icon(frame, self, "Starts at = where each file begins, in seconds, compared with the first one. "
@@ -228,6 +229,11 @@ class SessionMixin:
                        font=ui_font(10), relief="flat", borderwidth=1)
         menu.add_command(label="Add another recording...", command=lambda: self._add_recording(item))
         menu.add_command(label="Line up times with the voice", command=lambda: self._line_up_times(item))
+        if item.get("session"):
+            menu.add_command(label="Remove crosstalk (lines caught by another mic)",
+                             command=lambda: self._remove_crosstalk(item))
+        menu.add_command(label="Save video with captions...", command=self._save_with_captions)
+        menu.add_command(label="Check captions...", command=self._check_captions)
         menu.add_command(label="Show in folder", command=self._show_saved_in_folder)
         menu.add_separator()
         menu.add_command(label="Delete", command=self._delete_saved)
@@ -236,6 +242,74 @@ class SessionMixin:
         finally:
             menu.grab_release()
         return "break"
+
+    def _remove_crosstalk(self, item):
+        """A recording with a mic per person: each mic also catches the others, so the same words show
+        up on several tracks. Mark the copies for removal (kept: the mic that was closest, for its own
+        level). Nothing is saved until Save, so they can be looked over first (or Undo)."""
+        import os
+        parts = [p for p in self._existing_parts(item) if p.get("files") and p["files"].get("speakers")]
+        if len(parts) < 2:
+            self.status_var.set("Removing crosstalk needs a recording with a mic per person.")
+            return
+        iid = next((i for i, it in self.saved_items.items() if it.get("key") == item.get("key")), None)
+        if iid:                                     # show it (every track) so the marks can be seen
+            self.saved.selection_set(iid)
+            self._list_mode = "library"
+            self._on_saved_select()
+        self._show_tab("transcript")
+        self.status_var.set("Finding crosstalk (reading each mic's audio to tell who was closest)...")
+        self._busy(True, "Finding crosstalk")
+
+        def work():
+            from transcriber.session import envelope, find_crosstalk, relative_levels
+            from transcriber.speakers import read_speakers_file
+            err, drop, missing = "", [], []
+            try:
+                tracks, envs = [], []
+                for p in parts:
+                    data = read_speakers_file(p["files"]["speakers"]) or {}
+                    tracks.append([(float(s["start"]), float(s["end"]), s.get("text", ""))
+                                   for s in data.get("segments", [])])
+                    env = envelope(p["path"]) if p["path"] and os.path.exists(p["path"]) else None
+                    if env is None or not len(env):
+                        missing.append(p["label"] or os.path.basename(p["path"] or ""))
+                        env = None
+                    envs.append(env)
+                if missing:
+                    err = ("couldn't read the audio of " + ", ".join(missing) +
+                           " (is the drive connected?), so it can't tell who was closest")
+                else:
+                    drop = find_crosstalk(tracks, relative_levels(envs, [p["offset"] for p in parts]))
+            except Exception as exc:
+                err = str(exc) or type(exc).__name__
+            self.events.put(("call", lambda: self._crosstalk_found(parts, drop, err)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _crosstalk_found(self, parts, drop, err):
+        self._busy(False)
+        if err:
+            self.status_var.set(f"Couldn't remove crosstalk: {err}.")
+            return
+        known = {m["key"] for m in self._all_row_metas()}
+        new, n, per = dict(self._edits), 0, []
+        for p, d in zip(parts, drop):
+            fkey = self._file_key(p["files"])
+            marked = [k for k in sorted(d) if (fkey, k) in known and new.get((fkey, k), "") is not None]
+            for k in marked:
+                new[(fkey, k)] = None
+            n += len(marked)
+            if marked:
+                per.append(f"{p['label']} {len(marked)}")
+        if not n:
+            self.status_var.set("No crosstalk found: no line was caught by a closer mic too.")
+            return
+        self._end_edit()
+        self._push_state(new)
+        self._apply_edit_state(new)
+        self._rerender_in_place()
+        self.status_var.set(f"{n} line{'s' if n != 1 else ''} marked for removal ({', '.join(per)}): the same "
+                            "words, caught by another person's mic. Look them over, then Save (or Undo).")
 
     def _existing_parts(self, item) -> list:
         """What a saved transcript already has, as rows for the Add window:
@@ -305,7 +379,8 @@ class SessionMixin:
         self._session_label(job)
         self.thumb_q.put(("queue", iid, ref))
         self.tree.selection_set(iid)
-        self.tabs.select(0)
+        self._list_mode = "queue"
+        self._show_tab("queue")
         self.status_var.set(f"Combined into “{spec['name']}”. Click Transcribe when ready.")
 
     def _session_label(self, job):

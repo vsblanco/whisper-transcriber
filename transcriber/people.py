@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -25,6 +26,7 @@ else:
     APP_DIR = Path(os.environ.get("APPDATA", Path.home() / ".config")) / "WhisperTranscriber"
 PEOPLE_FILE = APP_DIR / "people.json"
 AVATAR_DIR = APP_DIR / "avatars"
+VOICE_DIR = APP_DIR / "voices"          # a short clip of each voice sample, to listen to
 
 # Colors for names and for initials circles (readable on both light and dark backgrounds).
 PERSON_COLORS = ["#3b82f6", "#f97316", "#10b981", "#a855f7", "#ef4444", "#14b8a6", "#eab308", "#ec4899"]
@@ -32,13 +34,29 @@ UNKNOWN_COLORS = ["#64748b", "#78716c", "#6b7280", "#71717a"]
 
 MATCH_THRESHOLD = 0.55     # how alike a voice must be to count as a known person (0..1)
 MAX_VOICES = 24            # voiceprints kept per person (newest win)
+ODD_ONE_OUT = 0.4          # a sample this unlike the person's others is probably not them (or silence)
 
 
 def cosine(a, b) -> float:
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(y * y for y in b))
-    return dot / (na * nb) if na and nb else 0.0
+    score = dot / (na * nb) if na and nb else 0.0
+    return score if math.isfinite(score) else 0.0          # a broken voiceprint matches nothing
+
+
+def _remove_clip(name: Optional[str]) -> None:
+    if name:
+        try:
+            (VOICE_DIR / name).unlink()
+        except OSError:
+            pass
+
+
+def new_clip_path() -> Path:
+    """Where to keep a new voice sample's clip."""
+    VOICE_DIR.mkdir(parents=True, exist_ok=True)
+    return VOICE_DIR / f"{uuid.uuid4().hex[:12]}.wav"
 
 
 class People:
@@ -54,6 +72,64 @@ class People:
             self.people = json.loads(self.path.read_text(encoding="utf-8")).get("people", [])
         except (OSError, ValueError):
             self.people = []
+        if self._tidy_voices():
+            self.save()
+
+    def _tidy_voices(self) -> bool:
+        """Drop voice samples that can't be right: broken ones (silence can give those), exact
+        copies, and a sample saved under two people (a speaker named, then renamed) stays only with
+        the one it sounds like. Returns True if anything changed."""
+        changed = False
+        for p in self.people:
+            infos, seen, keep = self._infos(p), set(), []
+            for k, v in enumerate(p.get("voices", [])):
+                key = tuple(v) if self.usable_print(v) else None
+                if key is None or key in seen:
+                    _remove_clip(infos[k].get("audio"))
+                    continue
+                seen.add(key)
+                keep.append(k)
+            if len(keep) != len(p.get("voices", [])):
+                p["voices"] = [p["voices"][k] for k in keep]
+                p["voice_info"] = [infos[k] for k in keep]
+                changed = True
+        owners: dict = {}
+        for p in self.people:
+            for v in p.get("voices", []):
+                owners.setdefault(tuple(v), []).append(p)
+        for key, ps in owners.items():
+            if len(ps) < 2:
+                continue
+            def fit(p, key=key):
+                others = [w for w in p["voices"] if tuple(w) != key]
+                return max((cosine(key, w) for w in others), default=-1.0)
+            best = max(ps, key=fit)
+            if fit(best) < 0:                    # nothing else to go by: leave it
+                continue
+            for p in ps:
+                if p is not best:
+                    k = next(i for i, w in enumerate(p["voices"]) if tuple(w) == key)
+                    infos = self._infos(p)
+                    p["voices"].pop(k)
+                    _remove_clip(infos.pop(k).get("audio"))
+                    changed = True
+        return changed
+
+    def forget_voice(self, voiceprint, keep_pid: Optional[str] = None) -> None:
+        """Remove this exact voice sample from everyone but keep_pid (it was learned under the wrong name)."""
+        key = [round(float(x), 5) for x in voiceprint or []]
+        changed = False
+        for p in self.people:
+            if p["id"] == keep_pid:
+                continue
+            infos = self._infos(p)
+            for k in range(len(p.get("voices", [])) - 1, -1, -1):
+                if p["voices"][k] == key:
+                    p["voices"].pop(k)
+                    _remove_clip(infos.pop(k).get("audio"))
+                    changed = True
+        if changed:
+            self.save()
 
     def save(self):
         try:
@@ -81,6 +157,12 @@ class People:
         self.save()
         return person
 
+    def set_color(self, pid: str, color: str):
+        p = self.get(pid)
+        if p and color and color.startswith("#") and len(color) == 7:
+            p["color"] = color.lower()
+            self.save()
+
     def rename(self, pid: str, name: str):
         p = self.get(pid)
         if p and name.strip():
@@ -97,6 +179,8 @@ class People:
 
     @staticmethod
     def _remove_files(p: dict):
+        for info in p.get("voice_info") or []:
+            _remove_clip(info.get("audio"))
         for key in ("photo", "photo_original"):
             if p.get(key):
                 try:
@@ -181,11 +265,71 @@ class People:
 
     # ------------------------------------------------------------ voices
 
-    def add_voice(self, pid: str, voiceprint) -> None:
+    @staticmethod
+    def usable_print(voiceprint) -> bool:
+        """A real voiceprint (not empty, all zeros or broken numbers, which silence can give)."""
+        try:
+            vals = [float(x) for x in voiceprint or []]
+        except (TypeError, ValueError):
+            return False
+        return bool(vals) and all(math.isfinite(x) for x in vals) and sum(x * x for x in vals) > 1e-6
+
+    @staticmethod
+    def _infos(p: dict) -> list:
+        """One info dict per voice sample (older samples get a blank one)."""
+        voices = p.get("voices", [])
+        infos = list(p.get("voice_info") or [])[:len(voices)]
+        infos += [{} for _ in range(len(voices) - len(infos))]
+        p["voice_info"] = infos
+        return infos
+
+    def voice_samples(self, pid: str) -> list:
+        """[(voiceprint, info)] oldest first. info: "added", "from", "audio" (clip file name), "seconds"."""
         p = self.get(pid)
-        if p and voiceprint:
-            p["voices"] = (p.get("voices", []) + [[round(float(x), 5) for x in voiceprint]])[-MAX_VOICES:]
-            self.save()
+        return list(zip(p.get("voices", []), self._infos(p))) if p else []
+
+    def add_voice(self, pid: str, voiceprint, info: Optional[dict] = None) -> bool:
+        """Learn a voice sample. Returns False (and keeps nothing) if the voiceprint isn't usable."""
+        p = self.get(pid)
+        if not p or not self.usable_print(voiceprint):
+            if info and info.get("audio"):
+                _remove_clip(info["audio"])
+            return False
+        infos = self._infos(p)
+        vp = [round(float(x), 5) for x in voiceprint]
+        if vp in p.get("voices", []):                     # already learned (the same speaker named again)
+            if info and info.get("audio"):
+                _remove_clip(info["audio"])
+            return True
+        p["voices"] = p.get("voices", []) + [vp]
+        infos.append(dict(info or {}, added=(info or {}).get("added") or time.strftime("%Y-%m-%d %H:%M")))
+        while len(p["voices"]) > MAX_VOICES:              # the oldest go first
+            p["voices"].pop(0)
+            _remove_clip(infos.pop(0).get("audio"))
+        self.save()
+        return True
+
+    def remove_voice(self, pid: str, index: int) -> None:
+        p = self.get(pid)
+        if not p or not 0 <= index < len(p.get("voices", [])):
+            return
+        infos = self._infos(p)
+        p["voices"].pop(index)
+        _remove_clip(infos.pop(index).get("audio"))
+        self.save()
+
+    def voice_fit(self, pid: str) -> list:
+        """How much each sample sounds like the person's other samples (0..1; None for a single sample)."""
+        voices = (self.get(pid) or {}).get("voices", [])
+        if len(voices) == 2:                       # can't tell which one is off, only that they differ
+            return [cosine(voices[0], voices[1])] * 2
+        if len(voices) < 2:
+            return [None] * len(voices)
+        out = []
+        for i, v in enumerate(voices):
+            scores = sorted(cosine(v, w) for j, w in enumerate(voices) if j != i)
+            out.append(scores[len(scores) // 2])
+        return out
 
     def match(self, voiceprint, exclude: set[str] = frozenset()) -> tuple[Optional[dict], float]:
         """The known person whose voice is most like this one, if alike enough."""

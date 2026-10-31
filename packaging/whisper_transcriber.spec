@@ -23,8 +23,11 @@ for pkg in ("tkinterdnd2", "sv_ttk"):
 datas += collect_data_files("faster_whisper")          # the voice-activity model it ships with
 # The speaker detection add-on runs this file in its own Python, so it's shipped as a plain file too.
 datas.append((os.path.join(ROOT, "transcriber", "diarize_worker.py"), "transcriber"))
+datas.append((os.path.join(ROOT, "transcriber", "nvidia_worker.py"), "transcriber"))   # (runs in the add-on's Python)
 binaries += collect_dynamic_libs("ctranslate2")
 hidden += ["vlc", "huggingface_hub", "tokenizers", "av", "onnxruntime", "certifi", "soundcard"]
+if sys.platform == "win32":
+    hidden += ["proctap", "proctap._native", "proctap.backends.windows"]   # recording one app's sound
 
 ffmpeg_dir = os.path.join(SPECPATH, "ffmpeg")
 if os.path.isdir(ffmpeg_dir):

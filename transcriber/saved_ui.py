@@ -197,7 +197,7 @@ class SavedMixin:
         else:
             files = v["files"]
             rows = rows_for(files, self.people)
-            entries = self._rows_entries(rows, files)
+            entries = self._view_entries([(r, files, "", 0, k) for k, r in enumerate(rows)])
             caps = [self._cap(r) for r in rows]
             track_names = ""
             fmts = " · ".join(f.upper() for f in ("txt", "srt", "vtt") if f in files)
@@ -212,14 +212,16 @@ class SavedMixin:
             self.version_cb.configure(values=[self._version_label(item, x) for x in reversed(versions)])
             self.version_var.set(self._version_label(item, v))
             self.version_info.configure(text="  ·  ".join(x for x in (track_names, fmts) if x))
-            self.version_del_btn.configure(text="Delete version", state="normal")
+            self._del_tip = "Delete this version"
+            self.version_del_btn.configure(state="normal")
         else:
             self.version_title.pack_forget()
             self.version_cb.pack_forget()
             details = [x for x in (track_names, v.get("model"), friendly_date(v["mtime"]), fmts) if x]
             self.version_info.configure(text="  ·  ".join(details))
             only = len(versions) == 1 and not (named and "" in item["tracks"])
-            self.version_del_btn.configure(text="Delete" if only else "Delete version", state="normal")
+            self._del_tip = "Delete this transcript" if only else "Delete this version"
+            self.version_del_btn.configure(state="normal")
 
         # Person button: only for transcripts made without speaker detection.
         from transcriber.speakers import has_speakers
@@ -242,6 +244,12 @@ class SavedMixin:
 
         self.player.load(playable, lambda v=v: v["caps"], note=note)
         self.player.captions = lambda v=v: v["caps"]   # same file, other version: just swap captions
+        self._pcaps_parts = ([(k, pv["files"]) for k, pv in v["parts"].items()] if key == self.TRACKS
+                             else [("", v["files"])])
+        self._pcaps_v = v
+        v["pcaps"] = self._preview_caps(self._pcaps_parts)
+        self.player.display_captions = (lambda v=v: v["pcaps"]) if v["pcaps"] else None
+        self.player.refresh_captions()
         if playable and item.get("session"):
             self.player.set_tracks(self._session_tracks(item["session"]))
         elif playable:
@@ -250,7 +258,7 @@ class SavedMixin:
                 self.player.set_tracks(self._player_tracks(source, done))
             else:
                 self.player.set_tracks(self._player_tracks(source, None))   # mixed: every track is in it
-        self._set_call(playable, caps)
+        self._set_call(playable, caps, list(v["parts"]) if key == self.TRACKS and v.get("parts") else None)
         if empty:
             entries.append(("This transcript is empty or couldn't be read.\n", "err"))
         self._render(item["key"], entries, scroll_end=False, versions=True)

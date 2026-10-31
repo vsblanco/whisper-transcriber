@@ -24,17 +24,20 @@ from transcriber.fonts import RIGHT_CLICK, ui_font
 from transcriber import __version__
 from transcriber.editing import EditingMixin
 from transcriber.finder import FindMixin
-from transcriber.icons import icon_button, setup_styles as setup_icon_styles
+from transcriber.icons import Tooltip, icon_button, setup_styles as setup_icon_styles
 from transcriber.people_ui import PeopleMixin
 from transcriber.search_ui import SearchMixin
 from transcriber.session_ui import SessionMixin
 from transcriber.markers_ui import MarkersMixin
 from transcriber.review_ui import ReviewMixin
+from transcriber.checks_ui import ChecksMixin
 from transcriber.setup_ui import SetupMixin
 from transcriber.update_ui import UpdateMixin
 from transcriber.settings_ui import SettingsMixin
 from transcriber.tools_ui import ToolsMixin
 from transcriber.tracks_ui import TracksMixin
+from transcriber.timeline_ui import TimelineMixin
+from transcriber.record_ui import RecordMixin
 from transcriber.ui_common import (
     APP_NAME,
     DONE,
@@ -75,7 +78,7 @@ from transcriber.loading_ui import LoadingScreen
 
 
 class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMixin, SettingsMixin, SearchMixin, ToolsMixin, SessionMixin,
-          MarkersMixin, ReviewMixin, SetupMixin, UpdateMixin, BaseTk):
+          MarkersMixin, ReviewMixin, ChecksMixin, SetupMixin, UpdateMixin, TimelineMixin, RecordMixin, BaseTk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
@@ -111,6 +114,10 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         self.track_nicknames: dict[str, str] = dict(s.get("track_nicknames", {}))
         # Speakers: who's talking, recognized from voice samples you tag (People).
         self.detect_speakers = tk.BooleanVar(value=bool(s.get("detect_speakers", False)))
+        self.extract_speech = tk.BooleanVar(value=bool(s.get("extract_speech", False)))
+        from transcriber import core as _core
+        _core.EXTRACT_SPEECH = bool(self.extract_speech.get())
+        self.extract_speech.trace_add("write", lambda *a: setattr(_core, "EXTRACT_SPEECH", bool(self.extract_speech.get())))
         self.hf_token = tk.StringVar(value=s.get("hf_token", ""))
         self.left_width = int(s.get("left_width") or 0)     # 0 = automatic
         self.vocab = s.get("vocab", "")                     # names and terms Whisper should know
@@ -120,8 +127,22 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         self.track_default = s.get("track_default", "each")
         self.track1_mix = tk.BooleanVar(value=bool(s.get("track1_is_mix", False)))
         self.engine_pref = s.get("engine", "auto")
+        self.record_prefs = s.get("record") if isinstance(s.get("record"), dict) else {}
+        self.speaker_model = s.get("speaker_model", "pyannote")
+        self.ts_millis = bool(s.get("ts_millis", False))
         self.caption_style = s.get("captions") or {}
+        self.transcript_view = "paragraphs" if s.get("transcript_view") == "paragraphs" else "lines"
+        self._expanded: set = set()          # paragraphs opened into their lines
+        self.timeline_open = bool(s.get("timeline_open", False))
+        self.timeline_h = int(s.get("timeline_h") or 0) or int(150 * self.ui_scale)
+        keys = s.get("timeline_keys") if isinstance(s.get("timeline_keys"), dict) else {}
+        self.timeline_keys = {"select": str(keys.get("select") or "s")[:1].lower(),
+                              "snip": str(keys.get("snip") or "b")[:1].lower(),
+                              "range": str(keys.get("range") or "r")[:1].lower()}
+        self._apply_caption_options()
         set_engine(self.engine_pref)
+        from transcriber.speakers import set_speaker_model
+        set_speaker_model(self.speaker_model)
         self.people = People()
         self.avatars = AvatarCache()
         self.avatars.shape = s.get("avatar_shape", "circle") if s.get("avatar_shape") in SHAPES else "circle"
@@ -159,7 +180,6 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
 
         self._build_ui()
         self._apply_theme()
-        self._search_focus(False)   # show the gray "Search transcripts" hint
         # Load the Transcripts tab in the background now, so switching to it is instant.
         self.after(300, lambda: self._refresh_saved(force=True))
         for var in (self.model_var, self.lang_var, self.out_var, *self.fmt_vars.values()):
@@ -186,6 +206,9 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
             return
         self.current_theme = mode
         p = PALETTE[mode]
+        if getattr(self, "_tl", None) is not None:          # the timeline draws its own colors
+            self.after_idle(lambda: (ttk.Style(self).configure("Tiny.TButton", padding=(4, 1)), self._tl.redraw(),
+                                     self._tl_sash.configure(background=self._palette()["hover"])))
         style = ttk.Style(self)
 
         if HAS_SV:
@@ -210,12 +233,10 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         style.configure("Section.TLabel", font=ui_font(11, bold=True))
         # Tk has no text opacity, so "faint" is a lighter shade that blends toward the background.
         style.configure("Faint.TLabel", foreground="#b4b4b4" if mode == "light" else "#5c5c5c", font=ui_font(9))
-        self._tab_cache = None   # tab sizes can change with the theme; measure again
+        self._paint_trash()      # (its color follows the theme)
         setup_icon_styles(self)
         if hasattr(self, "_sash"):
             self.after_idle(self._sash_theme)
-        if getattr(self, "_search_placeholder", False):
-            self.search_entry.configure(foreground=p["muted"])
         chip_bg, chip_hover = ("#ececec", "#dcdcdc") if mode == "light" else ("#2d2d2d", "#3a3a3a")
         style.configure("Chip.TLabel", background=chip_bg, foreground=p["fg"])
         style.configure("ChipHover.TLabel", background=chip_hover, foreground=DROP_ACCENT[mode])
@@ -314,6 +335,7 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         self._update_setup(row)
         ttk.Label(row, textvariable=self.status_var, anchor="w").pack(side="left", fill="x", expand=True)
 
+
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=12, pady=(0, 6))
         body.columnconfigure(0, minsize=int(450 * self.ui_scale), weight=0)   # left column keeps a steady width
@@ -344,24 +366,44 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         self._sash_line.bind("<Double-1>", self._sash_reset)
         self._sash_drag = None
         self.after_idle(self._sash_theme)
-        self.tabs = ttk.Notebook(left)
-        self.tabs.pack(fill="both", expand=True)
-        self._build_queue_tab()
-        self._build_saved_tab()
-        self.tabs.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-
-        # ---- bottom left: preview player with captions
+        # ---- left: the preview player, the whole height of the window
         box = ttk.LabelFrame(left, text="Preview")
-        box.pack(fill="x", pady=(8, 0))
+        # the subtitle timeline (Timeline button in the header) goes under the player, as wide as
+        # this column; the picture makes room for it
+        tl_holder = ttk.Frame(left)
+        tl_holder.pack(side="bottom", fill="x")
+        box.pack(fill="both", expand=True)
+        self._preview_box = box
+        self._left_col = left
+        self._timeline_setup(tl_holder, header)
         self.player = Player(box)
+        self.player.fill_height = True       # the picture area fills the column (letterboxed)
         self.player.pack(fill="x", padx=8, pady=8)
         self.player.on_time = self._on_player_time
         self.player.on_tracks_changed = self._on_tracks_muted
+        self.player.on_caption_size = self._set_caption_size
+        self.player.on_caption_edit = self._edit_at_caption
+        self.player.on_save_with_captions = self._save_with_captions
         self.player.set_caption_style(self.caption_style)
 
-        # ---- right: transcript of whatever is selected
-        self.right = ttk.LabelFrame(body, text="Transcript")
-        self.right.grid(row=0, column=2, sticky="nsew")
+        # ---- right: one row of tabs. Transcript (what's shown), Queue (files to transcribe) and
+        # Library (everything saved). Clicking a file in Queue or Library opens it in Transcript; the
+        # transcript follows whichever of the two lists you were last on (self._list_mode).
+        rightcol = ttk.Frame(body)
+        rightcol.grid(row=0, column=2, sticky="nsew")
+        self._rightcol = rightcol
+        self.tabs = ttk.Notebook(rightcol)
+        self.tabs.pack(fill="both", expand=True)
+        self.right = ttk.Frame(self.tabs)
+        self.tabs.add(self.right, text="Transcript")
+        self.title_label = ttk.Label(self.right, text="", font=ui_font(11, bold=True), anchor="w")
+        self.title_label.pack(fill="x", padx=10, pady=(8, 0))
+        self._list_mode = "queue"
+        self._build_queue_tab()
+        self._build_saved_tab()
+        self.tabs.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        for n, name in enumerate(("transcript", "queue", "library"), 1):
+            self.bind(f"<Control-Key-{n}>", lambda e, name=name: self._show_tab(name) or "break")
         self.text = tk.Text(self.right, wrap="word", font=ui_font(10), padx=10, pady=8,
                             relief="flat", borderwidth=0, highlightthickness=0, state="disabled", spacing1=3, spacing3=3)
         self._band_n = 0
@@ -383,8 +425,17 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         self.version_cb = ttk.Combobox(self.version_bar, textvariable=self.version_var, state="readonly", width=32)
         self.version_cb.pack(side="left")
         self.version_cb.bind("<<ComboboxSelected>>", self._on_version_picked)
-        self.version_del_btn = ttk.Button(self.version_bar, text="Delete version", command=self._delete_version)
+        self._del_tip = "Delete this version"
+        self.version_del_btn = icon_button(self.version_bar, self, "delete", lambda: self._del_tip, self._delete_version)
+        self._paint_trash()
         self.version_del_btn.pack(side="right")
+        # Lines / Paragraphs: a toggle that stays pressed while the transcript is shown as paragraphs.
+        self.view_var = tk.BooleanVar(value=self.transcript_view == "paragraphs")
+        self.view_btn = ttk.Checkbutton(self.version_bar, text="\u00b6", width=2, variable=self.view_var,
+                                        style="Toggle.TButton" if HAS_SV else "TCheckbutton",
+                                        command=lambda: self._set_view("paragraphs" if self.view_var.get() else "lines"))
+        self.view_btn.pack(side="right", padx=(0, 6))
+        Tooltip(self.view_btn, "Paragraphs: group lines by speaker. Click \u25b8 or double-click a paragraph to see its lines.")
         self.speakers_btn = icon_button(self.version_bar, self, "person", "Detect who's speaking in this transcript",
                                         self._add_speakers_later)
         self.stats_btn = icon_button(self.version_bar, self, "stats", "Talk time", self._show_talk_time)
@@ -415,6 +466,12 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         self.text.bind("<ButtonPress-1>", self._on_text_press, add="+")
         self.text.bind("<ButtonRelease-1>", self._on_row_click, add="+")
         self.text.tag_bind("who", "<Button-1>", self._on_who_click)
+        # Paragraph view: the arrow folds a paragraph open or closed.
+        self.text.tag_configure("grp", foreground="#8a8a8a", font=ui_font(10))
+        self.text.tag_configure("grpsp", font=ui_font(10))
+        self._hang_tags: set = set()
+        self.text.tag_bind("grp", "<Button-1>", self._on_paragraph_click)
+        self.text.tag_bind("grp", "<Enter>", lambda e: self.text.configure(cursor="hand2"))
         self._edit_setup()      # double-click a row to fix its wording
         self.text.bind(RIGHT_CLICK, self._on_row_menu)     # right-click a row
         self.text.bind("<Up>", lambda e: self._key_move(-1))
@@ -423,6 +480,10 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         self.text.bind("<Next>", lambda e: self._key_move(10))
         self.text.bind("<Return>", lambda e: self._key_enter())
         self.bind("<space>", self._space_key)      # space plays/pauses (not while typing)
+        # A clicked button keeps the keyboard focus, and space would press it again (Timeline, Snap,
+        # Fit...): in the main window space plays/pauses instead; in dialogs it presses as usual.
+        for cls in ("TButton", "TCheckbutton", "TRadiobutton", "Button", "Checkbutton", "Radiobutton"):
+            self.bind_class(cls, "<space>", self._space_on_button)
         self._find_setup()      # Ctrl+F
         self._find_theme()
         self._markers_setup()   # M marks a row
@@ -430,6 +491,7 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         # A right-aligned tab stop at the right edge, for the track name at the end of each row.
         self.text.bind("<Configure>", lambda e: self.text.configure(
             tabs=(max(e.width - 2 * int(self.text.cget("padx")) - 6, 50), "right")), add="+")
+        self.text.bind("<Configure>", self._paragraphs_resized, add="+")
 
     def _build_queue_tab(self):
         q = ttk.Frame(self.tabs)
@@ -443,16 +505,22 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         self.tree.column("length", width=62, anchor="center")
         self.tree.pack(fill="both", expand=True, padx=6, pady=(8, 0))
         self.tree.bind("<<TreeviewSelect>>", self._on_queue_select)
+        self.tree.bind("<ButtonRelease-1>", lambda e: self._open_on_click(e, self.tree), add="+")
         self.tree.bind("<Double-1>", self._open_selected_output)
         self.tree.bind(RIGHT_CLICK, self._queue_menu)
 
         hint = "Drag files here, or use Add files." if HAS_DND else "Use Add files to choose videos or audio."
-        ttk.Label(q, text=hint, style="Muted.TLabel").pack(anchor="w", padx=6, pady=(4, 0))
+        # (the hint and buttons are packed from the bottom first, so a short panel still shows them)
+        q_hint = ttk.Label(q, text=hint, style="Muted.TLabel")
+        q_hint.pack(side="bottom", anchor="w", padx=6, pady=(4, 0), before=self.tree)
         qb = ttk.Frame(q)
-        qb.pack(fill="x", padx=6, pady=6)
+        qb.pack(side="bottom", fill="x", padx=6, pady=6, before=q_hint)
         ttk.Button(qb, text="Add files...", command=self._add_files_dialog).pack(side="left")
         ttk.Button(qb, text="Remove", command=self._remove_selected).pack(side="left", padx=4)
         ttk.Button(qb, text="Clear finished", command=self._clear_finished).pack(side="left")
+        rec = ttk.Button(qb, text="\u25cf Record...", command=self._open_recorder)
+        rec.pack(side="left", padx=(8, 0))
+        Tooltip(rec, "Record your mic and/or PC audio (a stream, a call) and transcribe it")
 
         self.queue_frame = q
         self.drop_canvas = None
@@ -462,15 +530,11 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
 
     def _build_saved_tab(self):
         t = ttk.Frame(self.tabs)
-        self.tabs.add(t, text="Transcripts")
-        # Search box lives in the tab row, right of the "Transcripts" tab (shown only on that tab).
-        # The hint is gray text inside the box (not a label on top), so it shares the box's background.
-        self.search_entry = ttk.Entry(self.tabs.master, textvariable=self.search_var)
+        self.tabs.add(t, text="Library")
+        self.saved_frame = t
+        # Searching every transcript: Ctrl+F on this tab (the find box, see finder.py) sets search_var.
         self._search_placeholder = False
         self.search_var.trace_add("write", lambda *_: self._search_changed())
-        self.search_entry.bind("<FocusIn>", lambda e: self._search_focus(True))
-        self.search_entry.bind("<FocusOut>", lambda e: self._search_focus(False))
-        self.search_entry.bind("<Escape>", lambda e: (self.search_var.set(""), self.saved.focus_set()))
 
         self.saved = ttk.Treeview(t, columns=("versions", "date"), show="tree headings", selectmode="browse", height=3)
         self.saved.heading("#0", text="Transcript")
@@ -481,13 +545,15 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         self.saved.column("date", width=132, anchor="center")
         self.saved.pack(fill="both", expand=True, padx=6, pady=(8, 0))
         self.saved.bind("<<TreeviewSelect>>", lambda e: self._on_saved_select())
+        self.saved.bind("<ButtonRelease-1>", lambda e: self._open_on_click(e, self.saved), add="+")
         self.saved.bind("<Double-1>", lambda e: self._open_saved())
         if HAS_DND:
             self._make_drop_target(self.saved)
 
-        ttk.Label(t, textvariable=self.saved_count_var, style="Muted.TLabel").pack(anchor="w", padx=6, pady=(4, 0))
+        s_count = ttk.Label(t, textvariable=self.saved_count_var, style="Muted.TLabel")
+        s_count.pack(side="bottom", anchor="w", padx=6, pady=(4, 0), before=self.saved)
         sb = ttk.Frame(t)
-        sb.pack(fill="x", padx=6, pady=6)
+        sb.pack(side="bottom", fill="x", padx=6, pady=6, before=s_count)
         ttk.Button(sb, text="Open", command=self._open_saved).pack(side="left")
         icon_button(sb, self, "folder", "Show in folder", self._show_saved_in_folder).pack(side="left", padx=4)
         icon_button(sb, self, "refresh", "Refresh the list", lambda: self._refresh_saved(force=True)).pack(side="left")
@@ -592,6 +658,12 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         """Save the choice and load the new model in the background so Transcribe stays instant."""
         save_settings(self._settings())
         model = self.model_var.get()
+        if model == "parakeet":
+            from transcriber import setup_check
+            if not setup_check._nvidia_component()["ok"]:
+                self.status_var.set("Parakeet needs the NVIDIA models: install them here.")
+                self.after(100, lambda: self._open_setup("nvidia"))
+                return
         if is_model_loaded(model):
             self.status_var.set(f"Model set to '{model}'.")
             return
@@ -624,13 +696,12 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         """Shade every other timestamped line (only lines that start with a timestamp count),
         and remember each row's start time so the player position can be shown."""
         if "ts" in self.text.tag_names(f"{line}.0"):
-            m = re.match(r"\[(\d+):(\d+):(\d+)\]", self.text.get(f"{line}.0", f"{line}.12"))
+            m = re.match(r"\[(\d+):(\d+):(\d+(?:\.\d+)?)[\]–]", self.text.get(f"{line}.0", f"{line}.16"))
             if m:
-                h, mi, se = (int(g) for g in m.groups())
-                self._rows.append((h * 3600 + mi * 60 + se, line))
+                self._rows.append((int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]), line))
             self._band_n += 1
             if self._band_n % 2 == 0:
-                self.text.tag_add("band", f"{line}.0", f"{line}.0 lineend +1c")
+                self.text.tag_add("band", f"{line}.0", self._row_end(line))
 
     def _insert(self, text, tag=None):
         self.text.configure(state="normal")
@@ -658,11 +729,77 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         left = self._left_width(e.width)
         if abs(int(self._body.grid_columnconfigure(0)["minsize"]) - left) > 4:
             self._body.columnconfigure(0, minsize=left)
-        # Leave room for the list above it and the captions and controls below it.
-        room = e.height - int(400 * self.ui_scale)
-        self.player.max_screen_h = max(min(int(e.height * 0.55), room), 160)
+        self._fit_preview(e.height)
+
+    def _fit_preview(self, height=None):
+        """The picture gets the column's height, less the captions and controls under it and the
+        timeline when it's open."""
+        p = self.player
+        height = height or self._body.winfo_height()
+        self.update_idletasks()
+        below = (p.caption.winfo_reqheight() if p.caption.winfo_manager() else 0) + p._controls.winfo_reqheight()
+        holder = getattr(self, "_tl_holder", None)
+        if holder is not None and holder.winfo_manager() and getattr(self, "timeline_open", False):
+            below += holder.winfo_reqheight()
+        room = height - below - int(56 * self.ui_scale)
+        if abs(room - p.max_screen_h) > 2:
+            p.max_screen_h = max(room, 120)
+            p.after_idle(p.fit_screen)
 
     # ---- the divider between the list/player side and the transcript
+
+    # ---- the right side's tabs
+
+    def _ts(self, sec: float) -> str:
+        """A row's timestamp: 00:01:23, or 00:01:23.456 with milliseconds turned on."""
+        return format_timestamp(sec, millis=True, sep=".") if getattr(self, "ts_millis", False) else format_timestamp(sec)
+
+    def _set_ts_millis(self, on: bool):
+        self.ts_millis = bool(on)
+        self._pcol = None                          # (paragraph columns are measured from the timestamp)
+        self._name_w = {}
+        self._hang_tags = set()
+        save_settings(self._settings())
+        self._rerender_in_place()
+
+    def _paint_trash(self):
+        """The delete button's trash can: the icon font's when Windows has it, else drawn."""
+        from transcriber.icons import icon_family, trash_image
+        if icon_family(self) or not hasattr(self, "version_del_btn"):
+            return
+        try:
+            self._trash_img = trash_image(self._palette()["fg"], self.ui_scale)
+            self.version_del_btn.configure(image=self._trash_img, text="", width=0)
+        except Exception:
+            self.version_del_btn.configure(text="Delete")
+
+    def _show_tab(self, name: str):
+        """Switch to "transcript", "queue" or "library"."""
+        page = {"transcript": self.right, "queue": self.queue_frame, "library": self.saved_frame}[name]
+        if str(self.tabs.select()) != str(page):
+            self.tabs.select(page)
+
+    def _tab_name(self) -> str:
+        current = str(self.tabs.select())
+        return "queue" if current == str(self.queue_frame) else "library" if current == str(self.saved_frame) \
+            else "transcript"
+
+    def _set_title(self, title: str):
+        self.title_label.configure(text=title or "")
+
+    def _update_queue_tab(self):
+        """'Queue (2)' while files are waiting or being transcribed, so it shows from any tab."""
+        try:
+            n = sum(1 for j in self.jobs if j["status"] in (PENDING, WORKING))
+            self.tabs.tab(self.queue_frame, text=f"Queue ({n})" if n else "Queue")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _open_on_click(self, e, tree):
+        """A plain click on a file in Queue or Library opens it in the Transcript tab."""
+        if e.state & 0x0005 or not tree.identify_row(e.y) or tree.identify_region(e.x, e.y) not in ("tree", "cell"):
+            return
+        self.after_idle(lambda: self._show_tab("transcript"))
 
     def _sash_press(self, e):
         self._sash_drag = (e.x_root, int(self._body.grid_columnconfigure(0)["minsize"]))
@@ -743,7 +880,7 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
     def _render(self, title: str, entries, scroll_end: bool = True, versions: bool = False):
         self._edit_before_render()
         editable = {}
-        self.right.configure(text=title)
+        self._set_title(title)
         if versions and not self.version_bar.winfo_ismapped():
             self.version_bar.pack(fill="x", padx=8, pady=(8, 0), before=self.text_sb)
         elif not versions and self.version_bar.winfo_ismapped():
@@ -752,7 +889,17 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self._who_by_line = {}
+        self._group_lines = {}           # paragraph view: line -> {"key", "open", "metas"}
+        self._hidden_rows = []           # the lines inside folded paragraphs (not drawn on their own)
+        self._group_keys = []
         for entry in entries:
+            if entry[0] == "\x00grp":           # a paragraph starts on this line
+                info = entry[1]
+                self._group_lines[int(self.text.index("end-1c").split(".")[0])] = info
+                self._group_keys.append(info["key"])
+                if not info["open"]:
+                    self._hidden_rows += info["metas"]
+                continue
             if entry[0] == "\x00img":            # ("\x00img", image, tags): an inline picture
                 self.text.image_create("end", image=entry[1], padx=1)
                 if entry[2]:
@@ -768,11 +915,26 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
                     editable[line] = (entry[4], col, col + len(text))
                     continue
                 self.text.insert("end", entry[0], entry[1])
+        self._style_paragraphs()
         self._band_n = 0
         self._rows = []
         self._now_line = None
-        for line in range(1, int(self.text.index("end-1c").split(".")[0])):
-            self._band_line(line)
+        # Every other row shaded, and each row's time noted: from the text in one go (one call), not
+        # three Tk calls per row, which was most of the time a long transcript took to draw.
+        total = int(self.text.index("end-1c").split(".")[0])
+        content = self.text.get("1.0", "end-1c").split("\n")
+        ts_re = re.compile(r"\[(\d+):(\d+):(\d+(?:\.\d+)?)[\]\u2013]")
+        tsend_lines = {ln + 1 for ln, info in self._group_lines.items() if not info["open"] and info.get("span") == 2}
+        for line in range(1, total):
+            if line in tsend_lines:
+                continue                                    # a folded paragraph's second line
+            m = ts_re.match(content[line - 1]) if line - 1 < len(content) else None
+            if not m:
+                continue
+            self._rows.append((int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]), line))
+            self._band_n += 1
+            if self._band_n % 2 == 0:
+                self.text.tag_add("band", f"{line}.0", self._row_end(line))
         self.text.see("end" if scroll_end else "1.0")
         self.text.configure(state="disabled")
         self._edit_after_render(editable)
@@ -780,6 +942,7 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         self._markers_after_render()
         self._suspects_after_render()
         self._find_after_render()
+        self._timeline_refresh()
 
 
     def _general_append(self, text, tag=None):
@@ -790,9 +953,11 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
     def _row_at(self, x: int, y: int):
         """The logical line under the mouse if it's a timestamped row, else None."""
         line = int(self.text.index(f"@{x},{y}").split(".")[0])
+        if "tsend" in self.text.tag_names(f"{line}.0"):    # a folded paragraph's second line
+            line -= 1
         if "ts" not in self.text.tag_names(f"{line}.0"):
             return None
-        last = self.text.dlineinfo(f"{line}.0 lineend")   # last screen line of a wrapped row
+        last = self.text.dlineinfo(self._row_end(line) + " -1c")   # last screen line of a wrapped row
         if last and y > last[1] + last[3]:
             return None                                   # below the final row
         return line
@@ -803,7 +968,7 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         self.text.tag_remove("hover", "1.0", "end")
         self._hover_line = line
         if line is not None:
-            self.text.tag_add("hover", f"{line}.0", f"{line}.0 lineend +1c")
+            self.text.tag_add("hover", f"{line}.0", self._row_end(line))
         self.text.configure(cursor="xterm" if line is not None and line == self._editing else
                             "hand2" if line is not None else "")
 
@@ -816,7 +981,7 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         self.text.tag_remove("now", "1.0", "end")
         self._now_line = line
         if line is not None:
-            self.text.tag_add("now", f"{line}.0", f"{line}.0 lineend +1c")
+            self.text.tag_add("now", f"{line}.0", self._row_end(line))
 
     def _on_player_time(self, t, playing: bool):
         """Called by the player a few times a second: move the blue row to where playback is."""
@@ -827,6 +992,8 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         if t is None or not rows:
             self._set_now(None)
             return
+        if getattr(self, "_tl", None) is not None and self.timeline_open:
+            self._tl.set_time(t, playing)
         i = bisect.bisect_right([r[0] for r in rows], t) - 1
         line = rows[max(i, 0)][1]
         if line != self._now_line:
@@ -838,8 +1005,8 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         idx = self.text.index(f"@{event.x},{event.y}")
         if self._press_index != idx or self.text.tag_ranges("sel"):
             return                          # it was a drag to select text, not a click
-        if "who" in self.text.tag_names(idx):
-            return                          # clicking a name opens "Who is this?" instead
+        if "who" in self.text.tag_names(idx) or "grp" in self.text.tag_names(idx):
+            return                          # a name opens "Who is this?"; the arrow folds a paragraph
         line = self._row_at(event.x, event.y)
         if self.display and self.display[0] == "search":
             hit = getattr(self, "_search_hits", {}).get(int(idx.split(".")[0]))
@@ -885,11 +1052,14 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         return hit[1]
 
     def _seek_line(self, line: int):
-        m = re.match(r"\[(\d+):(\d+):(\d+)\]", self.text.get(f"{line}.0", f"{line}.0 lineend"))
+        m = re.match(r"\[(\d+):(\d+):(\d+(?:\.\d+)?)[\]–]", self.text.get(f"{line}.0", f"{line}.0 lineend"))
         if m:
-            h, mi, se = (int(g) for g in m.groups())
-            self.player.seek(h * 3600 + mi * 60 + se)
+            meta = self._row_meta.get(line)              # (the exact time, not the one rounded for showing)
+            sec = float(self._shown_time(meta)) if meta and "sec" in meta else \
+                int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
+            self.player.seek(sec)
             self._set_now(line)   # don't wait for the next player update
+            self._timeline_row_clicked(line)
 
     def _key_move(self, step: int):
         """Up/Down arrows move the highlighted row; Enter plays from it."""
@@ -909,17 +1079,31 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         return "break"
 
     def _space_key(self, e):
-        """Space bar: play/pause the preview, unless it's typing (editing a row or a time, a text box)
-        or pressing the focused button."""
+        """Space bar: play/pause the preview, unless it's typing (editing a row or a time, a text box)."""
         if self._editing is not None or getattr(self, "_time_entry", None):
             return None
         w = e.widget
-        if isinstance(w, (tk.Entry, ttk.Entry, tk.Spinbox, tk.Listbox, ttk.Button, tk.Button,
-                          ttk.Checkbutton, tk.Checkbutton, ttk.Radiobutton, tk.Radiobutton)):
+        if isinstance(w, (tk.Entry, ttk.Entry, tk.Spinbox, tk.Listbox)):
             return None
         if isinstance(w, tk.Text) and w is not self.text:
             return None
         self.player.toggle()
+        return "break"
+
+    def _space_on_button(self, e):
+        w = e.widget
+        try:
+            main = w.winfo_toplevel() is self
+        except (tk.TclError, AttributeError):
+            main = False
+        if main and self._editing is None and not getattr(self, "_time_entry", None):
+            self.player.toggle()
+            return "break"
+        try:
+            if str(w.cget("state")) != "disabled":
+                w.invoke()
+        except (tk.TclError, AttributeError):
+            pass
         return "break"
 
     def _key_enter(self):
@@ -930,16 +1114,36 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
             self._seek_line(self._hover_line)
         return "break"
 
-    def _rows_entries(self, rows, files, track: str = "", track_i: int = 0, indices=None):
+    def _rows_entries(self, rows, files, track: str = "", track_i: int = 0, indices=None, glyph=None):
         """Transcript rows as display entries: time, then (if known) a photo and name, then the text,
-        and (when several tracks are shown together) the track's name at the right end."""
+        and (when several tracks are shown together) the track's name at the right end.
+        glyph (paragraph view): None, "single", "inner" (a line of an opened paragraph) or a
+        paragraph info dict (its first line, with the fold-up arrow)."""
         size = max(int(18 * self.ui_scale), 14)
         entries = []
         for n, (sec, label, name, text, pid) in enumerate(rows):
             meta = {"files": files, "i": indices[n] if indices else n, "orig": text, "track": track, "sec": sec}
-            entries.append((f"[{format_timestamp(sec)}]  ", "ts"))
             person = self.people.get(pid)
-            if name:
+            if glyph is None:
+                entries.append((f"[{self._ts(sec)}]  ", "ts"))
+            else:
+                # Paragraph view: every row in the same columns (time, arrow, photo), and the text
+                # (wrapped lines and an opened paragraph's lines too) lined up where it starts.
+                if isinstance(glyph, dict):
+                    entries.append(("\x00grp", glyph))
+                lead = glyph.get("lead") if isinstance(glyph, dict) else None
+                if glyph == "inner":
+                    lead = getattr(self, "_inner_lead", None) or self._paragraph_col()
+                elif lead is None:
+                    lead = self._text_start(name)
+                    if isinstance(glyph, dict):
+                        glyph["lead"] = lead
+                self._inner_lead = lead
+                entries.append((f"[{self._ts(sec)}]", ("ts", self._hang_tag(lead))))
+                if isinstance(glyph, dict):
+                    entries.append(("  \u25be", ("grp",)))
+                entries.append(("\t\t" if glyph == "inner" and lead > self._paragraph_col() else "\t", None))
+            if name and glyph != "inner":        # (inside an opened paragraph the speaker is already shown)
                 color = person["color"] if person else "#64748b"
                 tag = self._color_tag(color)
                 img = self.avatars.get(person, size, name, color)
@@ -947,12 +1151,255 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
                 entries.append(("\x00img", img, ("who",)))
                 entries.append((f" {name}:  ", (tag, "who")))
                 entries.append((text, None, None, who, meta))
+            elif name:
+                entries.append((text, None, None, (files, label), meta))
             else:
                 entries.append((text, None, None, None, meta))
             if track and track != name:        # (a person's own mic: the name already says it)
                 entries.append((f"\t{track}", f"trk{track_i % 4}"))
             entries.append(("\n", None))
         return entries
+
+    GROUP_GAP = 2.0           # a longer pause starts a new paragraph
+    GROUP_MAX_SECS = 45.0
+    GROUP_MAX_CHARS = 450
+
+    def _view_entries(self, records) -> list:
+        """The transcript's rows for the panel, line by line or as paragraphs (Lines / Paragraphs).
+        records = [(row, files, track name shown, track index, row index in its file)]."""
+        if self.transcript_view != "paragraphs":
+            out = []
+            for r, files, track, ti, k in records:
+                out += self._rows_entries([r], files, track, ti, [k])
+            return out
+        out = []
+        for g in self._paragraphs(records):
+            recs = g["recs"]
+            if len(recs) == 1:
+                r, files, track, ti, k = recs[0]
+                out += self._rows_entries([r], files, track, ti, [k], glyph="single")
+                continue
+            metas = []
+            for r, files, track, ti, k in recs:
+                meta = {"files": files, "i": k, "orig": r[3], "track": track, "sec": r[0]}
+                self._edit_text_for(meta)
+                metas.append(meta)
+            changed = any(m["key"] in self._edits or self._time_key(m) in self._edits for m in metas)
+            info = {"key": g["key"], "open": g["key"] in self._expanded or changed, "metas": metas}
+            if info["open"]:
+                for n, (r, files, track, ti, k) in enumerate(recs):
+                    out += self._rows_entries([r], files, track, ti, [k], glyph=info if n == 0 else "inner")
+                continue
+            out += self._paragraph_entries(g, info)
+        return out
+
+    def _paragraphs(self, records) -> list:
+        """Consecutive lines of the same speaker (and track) with no long pause, as paragraphs:
+        [{"key", "recs", "end"}]."""
+        groups, cur = [], None
+        for rec in records:
+            r, files, track, ti, k = rec
+            words = self._words_for(files["words"]) if files.get("words") else None
+            ws = words[k] if words and k < len(words) and words[k] else None
+            end = float(ws[-1][1]) if ws else float(r[0]) + max(1.0, len(r[3]) / 14)
+            if cur is not None:
+                pr = cur["recs"][-1]
+                same = (pr[0][2] or "") == (r[2] or "") and pr[0][4] == r[4] and pr[2] == track and pr[1] is files
+                if (same and float(r[0]) - cur["end"] < self.GROUP_GAP
+                        and float(r[0]) - float(cur["recs"][0][0][0]) < self.GROUP_MAX_SECS
+                        and cur["chars"] + len(r[3]) < self.GROUP_MAX_CHARS):
+                    cur["recs"].append(rec)
+                    cur["end"] = max(cur["end"], end)
+                    cur["chars"] += len(r[3]) + 1
+                    continue
+            cur = {"key": (str(self._file_key(files)), k), "recs": [rec], "end": end, "chars": len(r[3])}
+            groups.append(cur)
+        return groups
+
+    def _paragraph_col(self) -> int:
+        """Where the photos start in paragraph view (pixels): right of the times and the arrow."""
+        hit = getattr(self, "_pcol", None)
+        if hit is None:
+            from tkinter import font as tkfont
+            ts = tkfont.Font(font=("Consolas", 9)).measure(f"[{self._ts(0)}]")
+            arrow = tkfont.Font(font=ui_font(10)).measure("  \u25b8  ")
+            hit = self._pcol = ts + arrow + 4
+        return hit
+
+    def _text_width(self, text: str) -> int:
+        """About how wide text is in the transcript's font: the letters' widths added up (each
+        letter measured once). Asking Tk to measure every word costs a millisecond a word, which is
+        seconds for a long transcript; adding letters is off by a pixel or two from kerning, which
+        is fine for deciding where a paragraph's first line ends."""
+        table = self.__dict__.get("_char_w")
+        if table is None:
+            from tkinter import font as tkfont
+            self._body_font = tkfont.Font(font=self.text.cget("font"))
+            table = self._char_w = {}
+        font = self._body_font
+        total = 0
+        for ch in text:
+            w = table.get(ch)
+            if w is None:
+                w = table[ch] = font.measure(ch)
+            total += w
+        return total
+
+    def _text_start(self, name: str) -> int:
+        """Where a row's words start in paragraph view: past the photo and the speaker's name."""
+        from tkinter import font as tkfont
+        col = self._paragraph_col()
+        if not name:
+            return col
+        cache = self.__dict__.setdefault("_name_w", {})
+        if name not in cache:
+            cache[name] = tkfont.Font(font=ui_font(10, bold=True)).measure(f" {name}:  ")
+        return col + max(int(18 * self.ui_scale), 14) + 2 + cache[name]
+
+    def _hang_tag(self, lead: int) -> str:
+        """A tag for a paragraph-view row: tab stops at the photo column and at its text, and
+        wrapped lines starting under its text."""
+        tag = f"hang{lead}"
+        if tag not in self._hang_tags:
+            self._hang_tags.add(tag)
+            self._configure_hang(tag, lead)
+        return tag
+
+    def _configure_hang(self, tag: str, lead: int):
+        t = self.text
+        col = self._paragraph_col()
+        right = max(t.winfo_width() - 2 * int(t.cget("padx")) - 6, lead + 60)
+        stops = (col, "left") + ((lead, "left") if lead > col else ()) + (right, "right")
+        t.tag_configure(tag, tabs=stops, tabstyle="wordprocessor", lmargin2=lead)
+
+    def _paragraph_entries(self, g, info) -> list:
+        """A folded paragraph, two lines tall: the start time with the end time under it, and the
+        speaker and text in a column of their own (the text never runs under the times)."""
+        recs = g["recs"]
+        (sec, label, name, _text, pid), files, track, ti, _k = recs[0]
+        size = max(int(18 * self.ui_scale), 14)
+        words = " ".join(r[3] for r, *_ in recs).split()
+        # how much fits on the first line (the rest goes on the second, next to the end time)
+        col = self._paragraph_col()
+        width = self.text.winfo_width() if self.text.winfo_width() > 50 else 640
+        self._para_w = width
+        room = width - 2 * int(self.text.cget("padx")) - col - 12
+        if name:
+            room -= size + 4 + self._text_start(name) - col - size - 2
+        if track and track != name:
+            room -= self._text_width(track) + 24
+        # how many words fit (widths from the letters, so a little margin for kerning)
+        space = self._text_width(" ")
+        room -= 6
+        n, used = 0, 0
+        while n < len(words):
+            add = self._text_width(words[n]) + (space if n else 0)
+            if used + add > room:
+                break
+            used += add
+            n += 1
+        n = max(n, 1) if room > 60 else n
+        first, rest = " ".join(words[:n]), " ".join(words[n:])
+        info["span"] = 2
+        hang = self._hang_tag(self._text_start(name))
+        entries = [("\x00grp", info), (f"[{self._ts(sec)}]", ("ts", hang)), ("  \u25b8", ("grp",)),
+                   ("\t", None)]
+        person = self.people.get(pid)
+        if name:
+            color = person["color"] if person else "#64748b"
+            entries.append(("\x00img", self.avatars.get(person, size, name, color), ("who",)))
+            entries.append((f" {name}:  ", (self._color_tag(color), "who"), None, (files, label)))
+        entries.append((first, None))
+        if track and track != name:          # (room for it was kept on the first line)
+            entries.append((f"\t{track}", f"trk{ti % 4}"))
+        entries.append(("\n", None))
+        entries.append((f"[{self._ts(g['end'])}]", ("tsend", hang)))
+        entries.append((("\t\t" if name else "\t") + rest, None))
+        entries.append(("\n", None))
+        return entries
+
+    def _row_end(self, line: int) -> str:
+        """The end of a row in the transcript (a folded paragraph is two lines)."""
+        info = getattr(self, "_group_lines", {}).get(line)
+        if info and not info["open"] and info.get("span") == 2:
+            return f"{line + 1}.0 lineend +1c"
+        return f"{line}.0 lineend +1c"
+
+    def _paragraphs_resized(self, e):
+        """Paragraphs fill their first line to the panel's width: fit them again after a resize."""
+        used = getattr(self, "_para_w", None)          # the width the paragraphs were last fitted to
+        if self.transcript_view != "paragraphs" or used is None or abs(e.width - used) < 30:
+            return
+        self._para_w = e.width
+        if getattr(self, "_para_job", None):
+            self.after_cancel(self._para_job)
+        self._para_job = self.after(250, lambda: (setattr(self, "_para_job", None), self._rerender_in_place()))
+
+    def _style_paragraphs(self):
+        """Paragraph view: the rows' tab stops follow the panel's width (the track name sits at the
+        right edge), and a folded paragraph's two lines read as one block."""
+        t = self.text
+        for tag in self._hang_tags:
+            self._configure_hang(tag, int(tag[4:]))
+            # Tk takes a wrapped line's indent from its own first character, so the whole row
+            # carries the tag (it's put on the timestamp when the row is drawn).
+            ranges = t.tag_ranges(tag)
+            for start in ranges[::2]:
+                t.tag_add(tag, f"{start} linestart", f"{start} lineend +1c")
+        t.tag_configure("tsend", font=("Consolas", 9), foreground=self._palette()["ts"])
+        t.tag_configure("grptop", spacing3=0)
+        t.tag_configure("grpbot", spacing1=0)
+        for tag in ("grptop", "grpbot"):
+            t.tag_remove(tag, "1.0", "end")
+        for line, info in getattr(self, "_group_lines", {}).items():
+            if not info["open"] and info.get("span") == 2:
+                t.tag_add("grptop", f"{line}.0", f"{line}.0 lineend +1c")
+                t.tag_add("grpbot", f"{line + 1}.0", f"{line + 1}.0 lineend +1c")
+
+    def _all_row_metas(self) -> list:
+        """Every row shown, including the ones inside folded paragraphs."""
+        return list(getattr(self, "_row_meta", {}).values()) + list(getattr(self, "_hidden_rows", []))
+
+    def _set_view(self, view: str):
+        if view == self.transcript_view:
+            return
+        self.transcript_view = view
+        self.view_var.set(view == "paragraphs")
+        save_settings(self._settings())
+        self._rerender_in_place()
+
+    def _toggle_paragraph(self, line: int, open_: Optional[bool] = None):
+        info = getattr(self, "_group_lines", {}).get(line)
+        if not info:
+            return
+        want = (not info["open"]) if open_ is None else open_
+        if want:
+            self._expanded.add(info["key"])
+        else:
+            self._expanded.discard(info["key"])
+        self._rerender_in_place(focus_key=info["key"])
+
+    def _expand_all(self, open_: bool):
+        if open_:
+            self._expanded.update(getattr(self, "_group_keys", []))
+        else:
+            self._expanded.clear()
+        self._rerender_in_place()
+
+    def _rerender_in_place(self, focus_key=None):
+        """Draw the transcript again without jumping away from where you were looking."""
+        top = self.text.yview()[0]
+        self._redisplay()
+        self.text.yview_moveto(top)
+        if focus_key is not None:
+            line = next((ln for ln, info in self._group_lines.items() if info["key"] == focus_key), None)
+            if line:
+                self.text.see(f"{line}.0")
+
+    def _on_paragraph_click(self, event):
+        line = int(self.text.index(f"@{event.x},{event.y}").split(".")[0])
+        self._toggle_paragraph(line)
+        return "break"
 
     def _color_tag(self, color: str) -> str:
         tag = "pc" + color.lstrip("#")
@@ -974,8 +1421,11 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
         self._render("Transcript", entries)
 
 
-    def _set_call(self, source, caps):
-        """The named speakers, for the player's call view (audio files, or the Audio only view)."""
+    TILE_COLORS = ["#79b0ff", "#ffb07a", "#7ddca0", "#d1a3ff"]     # the transcript's track colors (dark)
+
+    def _set_call(self, source, caps, track_order=None):
+        """The named speakers, for the player's call view (audio files, or the Audio only view).
+        Without speakers, each separately transcribed track (Mic, Discord...) gets a tile instead."""
         tiles, audio_file = [], False
         if source and os.path.exists(source):
             cache = self.__dict__.setdefault("_video_cache", {})
@@ -988,6 +1438,15 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
                 if name and name not in seen:
                     seen.add(name)
                     tiles.append({"name": name, "color": cap[3], "person": self.people.by_name(name)})
+            if not tiles:
+                order = list(track_order or [])
+                for cap in caps:
+                    if len(cap) > 4 and cap[4] and cap[4] not in order:
+                        order.append(cap[4])
+                for i, track in enumerate(order):
+                    person = self.people.by_name(track)      # a mic named after someone shows their photo
+                    tiles.append({"name": track, "track": track, "person": person,
+                                  "color": person["color"] if person else self.TILE_COLORS[i % 4]})
         self.player.set_call(tiles, self.avatars.shape, audio_file=audio_file)
 
     def _cap(self, r) -> tuple:
@@ -1007,59 +1466,145 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
                 rows.append((r, i, name, files, k))
         rows.sort(key=lambda x: (x[0][0], x[1]))
         many = len(parts) > 1
-        entries, caps = [], []
-        for r, i, name, files, k in rows:
-            entries += self._rows_entries([r], files, track=name if many else "", track_i=i, indices=[k])
-            caps.append(self._cap(r) + (name if many else "",))   # the track, so muted tracks hide
+        caps = [self._cap(r) + (name if many else "",) for r, i, name, files, k in rows]   # track: muted ones hide
+        entries = self._view_entries([(r, files, name if many else "", i, k) for r, i, name, files, k in rows])
         return entries, caps
 
+
+    def _refresh_preview_caps(self, now: bool = False):
+        """The player's captions again (after an unsaved edit), for the transcript shown. Several
+        changes in a row (typing) rebuild them once."""
+        if not now:
+            if getattr(self, "_pcaps_job", None) is None:
+                self._pcaps_job = self.after(250, lambda: self._refresh_preview_caps(now=True))
+            return
+        self._pcaps_job = None
+        v, parts = getattr(self, "_pcaps_v", None), getattr(self, "_pcaps_parts", None)
+        if v is None or parts is None or not getattr(self, "display", None) or self.display[0] != "saved":
+            return
+        v["pcaps"] = self._preview_caps(parts)
+        self.player.display_captions = (lambda v=v: v["pcaps"]) if v["pcaps"] else None
+        self.player._caption_shown = "redraw"
+        self.player.refresh_captions()
+
+    def _set_caption_size(self, pct: int):
+        """Caption size picked from the video's right-click menu."""
+        self.caption_style = {**(self.caption_style or {}), "size": int(pct)}
+        self.player.set_caption_style(self.caption_style)
+        save_settings(self._settings())
+        self.status_var.set(f"Caption size: {pct}%")
+
+    def _apply_caption_options(self):
+        """Settings > Captions choices that the caption files and transcription read."""
+        from transcriber import captions as C, core
+        from transcriber.player import DEFAULT_CAPTIONS
+        style = {**DEFAULT_CAPTIONS, **(self.caption_style or {})}
+        C.OPTIONS.update(split=bool(style["split"]), cuts=bool(style["cuts"]),
+                         overlap=style.get("overlap") or "layer")
+        core.KEEP_SOUNDS = bool(style["sounds"])
+
+    def _preview_caps(self, parts) -> list:
+        """Caption-sized pieces for the player, like the exported captions: [(start, text, name,
+        name color, track, end)]. parts = [(track name, files)]. Built once for a given state of the
+        files and pending edits (it's asked for again on every redraw)."""
+        from transcriber import captions as C
+        if not C.OPTIONS.get("split", True):
+            return []
+        edits = getattr(self, "_edits", {}) or {}
+        try:
+            stamp = tuple((track, str(files.get("speakers") or files.get("txt")),
+                           os.path.getmtime(files["speakers"]) if files.get("speakers") else 0,
+                           os.path.getmtime(files["words"]) if files.get("words") and os.path.exists(files["words"]) else 0)
+                          for track, files in parts)
+        except OSError:
+            stamp = None
+        key = (stamp, tuple(sorted((k, v if not isinstance(v, list) else tuple(v)) for k, v in edits.items())),
+               tuple(sorted(C.OPTIONS.items())), tuple((p["id"], p.get("color"), p.get("name")) for p in self.people.people))
+        cached = getattr(self, "_pcaps_cache", None)
+        if stamp is not None and cached and cached[0] == key:
+            self._pcaps_spans = cached[2]
+            return cached[1]
+        out = self._preview_caps_build(parts)
+        if stamp is not None:
+            self._pcaps_cache = (key, out, self._pcaps_spans)
+        return out
+
+    def _preview_caps_build(self, parts) -> list:
+        from transcriber import captions as C
+        many = len(parts) > 1
+        lines = []
+        edits = getattr(self, "_edits", {}) or {}
+        tuples = getattr(self, "_pcaps_tuples", None) or {}      # word lists as tuples, kept between builds
+        self._pcaps_tuples = fresh = {}
+        for track, files in parts:
+            words = self._words_for(files["words"]) if files.get("words") else None
+            segs, data = self._tl_segments(files) if hasattr(self, "_tl_segments") else ([], None)
+            rows = rows_for(files, self.people, data if data and data.get("segments") else None)
+            fkey = self._file_key(files)
+            for k, (sec, _label, name, text, pid) in enumerate(rows):
+                nxt = rows[k + 1][0] if k + 1 < len(rows) else sec + 8
+                ws = None
+                if words and k < len(words) and words[k]:
+                    ws = tuples.get(id(words[k]))
+                    if ws is None or ws[0] is not words[k]:
+                        ws = (words[k], tuple(tuple(w) for w in words[k]))
+                    fresh[id(words[k])] = ws
+                    ws = list(ws[1])
+                seg = segs[k] if k < len(segs) else {}
+                seg_end = float(seg.get("end") or 0)
+                end = ws[-1][1] if ws else seg_end if seg_end > sec else max(min(nxt, sec + 8), sec + 0.5)
+                fixed = bool(seg.get("fixed"))           # its time was set on the timeline and saved
+                if fixed:
+                    end = float(seg.get("end", end))
+                # unsaved edits show right away: new text, deleted lines, new times (timeline)
+                if (fkey, k) in edits:
+                    if edits[(fkey, k)] is None:
+                        continue
+                    text, ws = edits[(fkey, k)], None
+                layer = edits.get((fkey, k, "layer"), seg.get("layer")) if (fkey, k, "layer") in edits else seg.get("layer")
+                t = edits.get((fkey, k, "t"))
+                if t is not None:
+                    s2, e2 = (float(t[0]), float(t[1])) if isinstance(t, (tuple, list)) else \
+                        (float(t), float(t) + (end - sec))
+                    if ws and abs((e2 - s2) - (end - sec)) < 0.02:      # moved as a whole: words move too
+                        ws = [(a + s2 - sec, b + s2 - sec, w) for a, b, w in ws]
+                    sec, end = s2, e2
+                    fixed = isinstance(t, (tuple, list)) or fixed     # (set on the timeline: shown exactly)
+                person = self.people.get(pid)
+                lines.append(C.Line(sec, end, text, name or "", ws, track if many else "",
+                                    (person["color"] if person else "#9aa5b1") if name else "", fixed,
+                                    int(layer) if layer is not None else None, src=(fkey, k)))
+        self._pcaps_spans = {}
+        try:
+            cues = C.build(lines, names="off")
+        except Exception:
+            return []
+        # when each line's caption is on screen (it can outlast the line, to be read): the timeline shows it
+        spans: dict = {}
+        for c in cues:
+            for key in c.src:
+                a, b = spans.get(key, (c.start, c.end))
+                spans[key] = (min(a, c.start), max(b, c.end))
+        self._pcaps_spans = spans
+        self._pcaps_cues = cues                     # (the caption checks look at these)
+        return [(c.start, c.text, c.name, c.color, c.track, c.end, c.layer, tuple(c.src)) for c in cues]
 
     TRACKS = "\x00tracks"   # the separate-tracks view: every track together, in time order
 
 
     SEARCH_HINT = "Search transcripts"
 
-    def _tab_extent(self) -> tuple[int, int]:
-        """(right edge of the last tab, tab row height) in pixels, found by probing the notebook."""
-        nb = self.tabs
-        nb.update_idletasks()
-
-        def tab_at(x, y):
-            try:
-                i = nb.index(f"@{x},{y}")
-                return int(i) if str(i) != "" else -1
-            except (tk.TclError, ValueError):
-                return -1
-
-        height = 0
-        for y in range(1, 80):
-            if tab_at(12, y) == 0:
-                height = y
-        mid = max(height // 2, 6)
-        right = 0
-        for x in range(0, nb.winfo_width(), 2):
-            if tab_at(x, mid) == nb.index("end") - 1:
-                right = x
-        return right, height or 30
-
-    def _place_search(self, show: bool):
-        if not show:
-            self.search_entry.place_forget()
-            return
-        if not getattr(self, "_tab_cache", None) or not self._tab_cache[0]:
-            self._tab_cache = self._tab_extent()
-        right, height = self._tab_cache
-        start = right + 10
-        self.search_entry.place(in_=self.tabs, x=start, y=0, relwidth=1.0, width=-start - 2, height=max(height, 26))
-        tk.Misc.lift(self.search_entry)
-
     def _on_tab_changed(self, _event=None):
-        self._place_search(self.tabs.index("current") == 1)
-        if self.tabs.index("current") == 0:
+        name = self._tab_name()
+        self._find_tab_changed(name)
+        if name == "queue" and self._list_mode != "queue":
+            self._list_mode = "queue"
             self._on_queue_select()
-        else:
+        elif name == "library":
             self._refresh_saved()
-            self._on_saved_select()
+            if self._list_mode != "library":
+                self._list_mode = "library"
+                self._on_saved_select()
 
     # ------------------------------------------------------------------ queue management
 
@@ -1159,11 +1704,19 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
             "allow_network_delete": self.allow_network_delete.get(),
             "track_nicknames": self.track_nicknames,
             "detect_speakers": self.detect_speakers.get(),
+            "extract_speech": bool(self.extract_speech.get()),
             "hf_token": self.hf_token.get().strip(),
             "track_default": self.track_default,
             "track1_is_mix": self.track1_mix.get(),
             "engine": self.engine_pref,
+            "record": dict(getattr(self, "record_prefs", {}) or {}),
+            "speaker_model": getattr(self, "speaker_model", "pyannote"),
+            "ts_millis": bool(getattr(self, "ts_millis", False)),
             "captions": self.caption_style,
+            "transcript_view": self.transcript_view,
+            "timeline_open": bool(getattr(self, "timeline_open", False)),
+            "timeline_h": int(getattr(self, "timeline_h", 150)),
+            "timeline_keys": dict(getattr(self, "timeline_keys", {"select": "s", "snip": "b", "range": "r"})),
             "avatar_shape": self.avatars.shape,
             "window": self._normal_geometry or self.geometry(),
             "zoomed": self.state() == "zoomed",
@@ -1183,20 +1736,54 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
             self.cancel_flag.set()
         save_settings(self._settings())
         self.player.release()
+        from transcriber import crashlog
+        crashlog.stop()
         self.destroy()
+
+    def report_callback_exception(self, kind, exc, tb):
+        """An error in a button, menu or timer: keep going, but save the details."""
+        from transcriber import crashlog
+        crashlog.log_error("Error in the window", exc, tb)
+        try:
+            self.status_var.set(f"Something went wrong: {exc} (saved to the error log: Settings > Error logs)")
+        except Exception:
+            pass
+
+    def _crash_context(self) -> str:
+        """What was going on, for the error log."""
+        bits = []
+        d = getattr(self, "display", None)
+        if d:
+            item = self.saved_items.get(d[1]) if d[0] == "saved" and hasattr(self, "saved_items") else None
+            bits.append(f"{d[0]}" + (f" '{item.get('key')}'" if item else ""))
+        bits.append(f"view={getattr(self, 'transcript_view', '?')}")
+        bits.append(f"timeline={'on' if getattr(self, 'timeline_open', False) else 'off'}")
+        bits.append(f"unsaved edits={len(getattr(self, '_edits', {}) or {})}")
+        if getattr(self, "_editing", None) is not None:
+            bits.append("editing a line")
+        if getattr(self, "worker", None) and self.worker.is_alive():
+            bits.append("transcribing")
+        player = getattr(self, "player", None)
+        if player is not None and getattr(player, "path", None):
+            bits.append(f"player: {os.path.basename(player.path)}"
+                        + (" (Audio only)" if getattr(player, "audio_only_view", False) else ""))
+        return ", ".join(bits)
 
     def show_ready(self, problems: list[str]):
         """Called by the loading screen once everything is loaded (or it was skipped)."""
+        from transcriber import crashlog
         for msg in problems:
             self._general_append(msg + "\n\n", "err")
         model = self.model_var.get()
         if not problems and is_model_loaded(model):
             self.status_var.set(f"Ready. '{model}' model loaded. "
                                 + (f"{self._count(PENDING)} file(s) ready." if self.jobs else "Add files to get started."))
+        if crashlog.previous_crash is not None:
+            self.status_var.set("The app closed unexpectedly last time. The details were saved "
+                                "(Settings > Error logs).")
         self.deiconify()
         if self._start_zoomed:
             self.state("zoomed")
-        self.after(150, lambda: setattr(self, "_tab_cache", self._tab_extent()))   # measure once it's visible
         self.after(5000, self._auto_update_check)
         self.lift()
         self.focus_force()
@@ -1218,9 +1805,9 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
                 try:
                     self._handle_event(ev)
                 except Exception as exc:
-                    import traceback
-                    traceback.print_exc()
-                    self.status_var.set(f"Something went wrong updating the window: {exc}")
+                    from transcriber import crashlog
+                    crashlog.log_error(f"Updating the window ({ev[0] if ev else '?'})", exc)
+                    self.status_var.set(f"Something went wrong updating the window: {exc} (saved to the error log)")
         finally:
             self.after(100, self._poll_events)
 
@@ -1231,13 +1818,13 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
             self._set_status(job, WORKING)
             self.tree.see(job["iid"])
             self.status_var.set(f"Transcribing {n} of {total}: {Path(job['path']).name}")
-            if self.follow_live and self.tabs.index("current") == 0:
+            if self.follow_live and self._list_mode == "queue":
                 self.tree.selection_set(job["iid"])
                 self._show_job(job)
         elif kind == "segment":
             _, job, seg, pct = ev
             job["segs"].append((seg.start, seg.text))
-            self._job_append(job, f"[{format_timestamp(seg.start)}]  ", "ts")
+            self._job_append(job, f"[{self._ts(seg.start)}]  ", "ts")
             self._job_append(job, seg.text + "\n")
             self.progress.configure(value=pct)
             if job.get("duration"):
@@ -1325,6 +1912,10 @@ class App(QueueMixin, SavedMixin, FindMixin, EditingMixin, PeopleMixin, TracksMi
             self.status_var.set(msg + f". Saved to the {Path(self.out_var.get()).name} folder.")
             if done and not failed:
                 self.progress.configure(value=100)
+            if getattr(self, "_start_when_idle", False) and not self.cancel_flag.is_set():
+                self._start_when_idle = False          # a recording finished while this was running
+                if self._count(PENDING):
+                    self.after(300, self._start)
 
 
 def self_test() -> int:
@@ -1370,7 +1961,11 @@ def main():
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
+    from transcriber import crashlog
+    holder: dict = {}
+    crashlog.start(lambda: holder["app"]._crash_context() if "app" in holder else "starting up")
     app = App()
+    holder["app"] = app
     app.withdraw()                      # main window stays hidden until everything is loaded
     if len(sys.argv) > 1:  # files dropped onto the launcher or passed on the command line
         app._add_paths(sys.argv[1:])

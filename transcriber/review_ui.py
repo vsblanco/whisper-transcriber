@@ -177,7 +177,7 @@ class ReviewMixin:
         """(start, end) seconds of a row: its start, and the next row's start (same track)."""
         meta = self._row_meta[line]
         start = float(meta.get("sec", 0))
-        later = sorted(float(m.get("sec", 0)) for ln, m in self._row_meta.items()
+        later = sorted(float(m.get("sec", 0)) for m in self._all_row_metas()
                        if (m.get("track") or "") == (meta.get("track") or "") and float(m.get("sec", 0)) > start)
         end = later[0] if later else None
         wf = meta["files"].get("words")
@@ -194,19 +194,22 @@ class ReviewMixin:
 
     # ---------------------------------------------------------------- export clip
 
-    def _clip_dialog(self, line):
+    def _clip_dialog(self, line, start=None, end=None):
+        """Export clip: a line's time (padded a little), a range marker's, or start..end as given
+        (the stretch marked on the timeline)."""
         item = self._shown_item()
         source = item.get("source") if item else None
         if not source or not os.path.exists(source):
             self.status_var.set("The original file is needed to export a clip, and it isn't here.")
             return
-        rows = self._selected_rows(line)
-        start, _ = self._row_bounds(rows[0])
-        _, end = self._row_bounds(rows[-1])
-        m = getattr(self, "_marker_rows", {}).get(line)
-        if m and m.get("end"):
-            start, end = float(m["time"]), float(m["end"])
-        start, end = max(start - 0.3, 0.0), end + 0.3
+        if start is None or end is None:
+            rows = self._selected_rows(line)
+            start, _ = self._row_bounds(rows[0])
+            _, end = self._row_bounds(rows[-1])
+            m = getattr(self, "_marker_rows", {}).get(line)
+            if m and m.get("end"):
+                start, end = float(m["time"]), float(m["end"])
+            start, end = max(start - 0.3, 0.0), end + 0.3
         video = Path(source).suffix.lower() not in AUDIO_EXTENSIONS and not getattr(self.player, "_is_audio_file", False)
 
         win = tk.Toplevel(self)
@@ -226,13 +229,27 @@ class ReviewMixin:
         ttk.Entry(f, textvariable=s_var, width=10, justify="right").grid(row=1, column=1, sticky="w", padx=(8, 16))
         ttk.Label(f, text="To").grid(row=1, column=2, sticky="w")
         ttk.Entry(f, textvariable=e_var, width=10, justify="right").grid(row=1, column=3, sticky="w", padx=(8, 0))
-        caps_var = tk.BooleanVar(value=video)
+        caps_var = tk.StringVar(value=(self.caption_style or {}).get("clip_captions") or "both" if video else "off")
         cr = ttk.Frame(f)
         cr.grid(row=2, column=0, columnspan=4, sticky="w", pady=(12, 0))
-        ttk.Checkbutton(cr, text="Burn in captions", variable=caps_var,
+        hdr = ttk.Frame(cr)
+        hdr.pack(anchor="w")
+        ttk.Label(hdr, text="Captions").pack(side="left")
+        info_icon(hdr, self, "Burned in: drawn onto the picture with the look from Settings > Captions; every "
+                             "player shows them, and they can't be turned off. Subtitle track: the captions go "
+                             "inside the video as a track that VLC, TVs, YouTube and editors list under Subtitles "
+                             "(on by default, can be turned off). Microsoft's Media Player app ignores tracks "
+                             "inside mp4 files, so for it only burned-in captions show.").pack(side="left", padx=4)
+        for value, label in (("both", "Burned in + subtitle track"), ("burn", "Burned in"), ("track", "Subtitle track only"), ("off", "None")):
+            ttk.Radiobutton(cr, text=label, value=value, variable=caps_var,
+                            state="normal" if video else "disabled").pack(anchor="w", padx=(10, 0))
+        hl_var = tk.BooleanVar(value=bool((self.caption_style or {}).get("clip_highlight")))
+        hr = ttk.Frame(cr)
+        hr.pack(anchor="w", pady=(6, 0))
+        ttk.Checkbutton(hr, text="Highlight each word as it's said", variable=hl_var,
                         state="normal" if video else "disabled").pack(side="left")
-        info_icon(cr, self, "Puts the transcript's lines on the video, white text on a dark box, with the "
-                            "speaker's name. They can't be turned off afterwards.").pack(side="left", padx=4)
+        info_icon(hr, self, "In the burned-in captions, the word being spoken lights up in the speaker's color "
+                            "(yellow when there's no speaker), the way short-form videos do. Needs word timings.").pack(side="left", padx=4)
         sound = self._clip_sound_options(item, source)
         sound_vars = []
         if sound:
@@ -270,9 +287,15 @@ class ReviewMixin:
             if sound_vars and not picked:
                 status.configure(text="Pick at least one sound to include.")
                 return
-            plan = self._caption_plan() if (video and caps_var.get()) else None
+            mode = caps_var.get() if video else "off"
+            plan = self._caption_plan() if mode != "off" else None
+            if video:                                        # remembered for the next clip
+                self.caption_style = {**(self.caption_style or {}), "clip_captions": mode,
+                                      "clip_highlight": bool(hl_var.get())}
+                from transcriber.ui_common import save_settings
+                save_settings(self._settings())
             win.destroy()
-            self._export_clip(source, a, b, out, video, plan, picked or None)
+            self._export_clip(source, a, b, out, video, plan, picked or None, mode, bool(hl_var.get()))
 
         ttk.Button(buttons, text="Export", style="Accent.TButton", command=go).pack(side="right")
         ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side="right", padx=(0, 8))
@@ -286,24 +309,25 @@ class ReviewMixin:
         win.grab_set()
 
     def _caption_plan(self) -> list:
-        """What's needed to time the shown transcript's captions (gathered here, in the window's
-        thread; the slow part runs in timed_captions): one group per version part, with the audio
-        it came from: [{"audio", "offset", "rows": [(text, name, (start, end) from the words)]}]."""
+        """What's needed to make the shown transcript's captions (gathered here, in the window's
+        thread; the slow part runs in caption_cues): one group per version part, with the audio it
+        came from: [{"audio", "offset", "rows": [(text, name, (start, end), words, track, color)]}]."""
         from transcriber.core import Segment
         from transcriber.timing import row_spans
         item = self._shown_item() or {}
         names = {}
-        for cap in self.player.captions() or []:
+        for cap in self.player.captions() or []:          # the per-line captions (names and colors)
             if len(cap) > 2:
-                names[(int(cap[0]), cap[1])] = cap[2] or ""
+                names[(int(cap[0]), cap[1])] = (cap[2] or "", cap[3] if len(cap) > 3 else "")
         session = {}
         if item.get("session"):
             from transcriber.session import read_session
             session = {f["label"]: (f["path"], float(f.get("offset", 0)))
                        for f in (read_session(item["session"]) or {}).get("files") or []}
         groups: dict = {}
-        for line in sorted(getattr(self, "_row_meta", {})):
-            meta = self._row_meta[line]
+        metas = self._all_row_metas()
+        tracks = {m.get("track") or "" for m in metas}
+        for meta in metas:
             if self._is_deleted(meta):
                 continue
             key = str(self._file_key(meta["files"]))
@@ -315,16 +339,24 @@ class ReviewMixin:
             ws = g["words"][meta["i"]] if g["words"] and meta["i"] < len(g["words"]) else None
             sec = float(meta.get("sec", 0))
             span = row_spans([Segment(sec, sec + 3, meta["orig"])], [ws] if ws else None)[0]
-            g["rows"].append((meta["orig"], names.get((int(sec), meta["orig"]), ""), span))
+            seg = self._tl_segments(meta["files"])[0] if hasattr(self, "_tl_segments") else []
+            seg = seg[meta["i"]] if meta["i"] < len(seg) else {}
+            fixed = bool(seg.get("fixed"))           # set on the timeline: kept exactly, not lined up again
+            if fixed:
+                span = (float(seg.get("start", sec)), float(seg.get("end", span[1])))
+            name, color = names.get((int(sec), meta["orig"]), ("", ""))
+            g["rows"].append((meta["orig"], name, span, [tuple(w) for w in ws] if ws else None,
+                              (meta.get("track") or "") if len(tracks) > 1 else "", color, fixed, seg.get("layer")))
         for g in groups.values():
             g.pop("words", None)
             g["rows"].sort(key=lambda r: r[2][0])
         return list(groups.values())
 
-    def timed_captions(self, plan: list) -> list:
-        """[(start, end, text, name)] for every caption, lined up with the voice in its audio
+    def timed_lines(self, plan: list) -> list:
+        """The lines (captions.Line) with their times lined up with the voice in their audio
         (can be slow on long files: run it off the window's thread)."""
         import os
+        from transcriber.captions import Line
         from transcriber.timing import snap, speech_mask
         cache = self.__dict__.setdefault("_mask_cache", {})
         out = []
@@ -339,29 +371,37 @@ class ReviewMixin:
                     spans = snap(spans, cache[key], g["offset"], [r[0] for r in g["rows"]])
                 except Exception:
                     pass
-            out += [(st, en, text, name) for (text, name, _s), (st, en) in zip(g["rows"], spans)]
-        return sorted(out, key=lambda c: c[0])
+            for (text, name, s0, words, track, color, fixed, layer), (st, en) in zip(g["rows"], spans):
+                # Whisper's first word often starts early: the words stay inside the lined-up time.
+                if fixed:                              # (set by hand on the timeline: as it is)
+                    st, en = s0
+                out.append(Line(st, en, text, name, words, track, color, fixed,
+                                int(layer) if layer is not None else None))
+        return sorted(out, key=lambda ln: ln.start)
 
-    @staticmethod
-    def captions_between(timed: list, a: float, b: float) -> list:
-        """[(start, end, text)] relative to a..b. Names go in front only when more than one person
-        talks (one voice: no names)."""
-        names = {c[3] for c in timed if c[3]}
-        out = []
-        for st, en, text, name in timed:
-            en = min(max(en, st + 0.8), st + 10)
-            if en <= a or st >= b:
-                continue
-            who = name if name and len(names) > 1 else ""
-            out.append((max(st, a) - a, min(en, b) - a, (f"{who}: " if who else "") + text))
-        return out
-
-    @staticmethod
-    def _srt(caps: list) -> str:
-        def ts(x):
-            ms = int(round(x * 1000))
-            return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
-        return "\n".join(f"{i}\n{ts(s)} --> {ts(e)}\n{t}\n" for i, (s, e, t) in enumerate(caps, 1))
+    def caption_cues(self, plan: list, video: Optional[str] = None, a: float = 0.0, b: Optional[float] = None) -> list:
+        """Captions (captions.Cue) for the plan: lined up with the voice, cut into caption-sized
+        pieces, and (for a video) moved onto nearby scene cuts between a and b."""
+        from transcriber import captions as C
+        lines = self.timed_lines(plan)
+        if b is not None:
+            lines = [ln for ln in lines if ln.end > a - 1 and ln.start < b + 1]
+        if not C.OPTIONS.get("split", True):
+            many = len({ln.name for ln in lines if ln.name}) > 1
+            cues = [C.Cue(ln.start, max(ln.end, ln.start + C.MIN_DUR), [(f"{ln.name}: " if ln.name and many else "")
+                                                                         + ln.text], ln.name) for ln in lines]
+        else:
+            cuts = None
+            if video and C.OPTIONS.get("cuts", True) and lines:
+                from transcriber.timing import scene_cuts
+                lo = a if b is not None else lines[0].start
+                hi = b if b is not None else lines[-1].end
+                try:
+                    cuts = scene_cuts(video, max(lo - 1, 0), hi + 1)
+                except Exception:
+                    cuts = None
+            cues = C.build(lines, cuts=cuts)
+        return C.between(cues, a, b) if b is not None else cues
 
     def _clip_sound_options(self, item, source) -> list:
         """The mics (combined recording) or audio tracks (OBS-style file) a clip can include:
@@ -390,10 +430,11 @@ class ReviewMixin:
                  "on": (t["n"] in playing) if playing else True} for t in tracks]
 
     @staticmethod
-    def clip_command(source, a, b, out, video, sources=None, srt=None, style="") -> list:
+    def clip_command(source, a, b, out, video, sources=None, srt=None, style="", track=None, language="") -> list:
         """The ffmpeg command for a clip from a to b seconds. sources: the sounds to mix
         ({"file": other recording or None for the source's own track "stream", "offset": where that
-        recording starts on the source's timeline}); None = the source's sound as it is."""
+        recording starts on the source's timeline}); None = the source's sound as it is. srt: captions
+        to burn in (an .ass file); track: an .srt to put inside as a subtitle track (times from 0)."""
         dur = b - a
         cmd = ["ffmpeg", "-y", "-v", "error", "-ss", f"{a:.3f}", "-t", f"{dur:.3f}", "-i", source]
         chains, labels, n_in = [], [], 1
@@ -416,6 +457,8 @@ class ReviewMixin:
                 lab = f"t{len(labels)}"
                 chains.append((f"[0:a:{stream}]" if stream is not None else "[0:a]") + f"anull[{lab}]")
                 labels.append(lab)
+        if track and video:                     # (every input comes before the output options)
+            cmd += ["-sub_charenc", "UTF-8", "-i", track]
         fc, amap = [], None
         if labels:
             fc += chains
@@ -428,11 +471,17 @@ class ReviewMixin:
         if video:
             vmap = "0:v:0"
             if srt:
-                fc.append(f"[0:v:0]subtitles={srt}:force_style='{style}'[vout]")
+                fc.append(f"[0:v:0]subtitles={srt}" + (f":force_style='{style}'" if style else "") + "[vout]")
                 vmap = "[vout]"
             if fc:
                 cmd += ["-filter_complex", ";".join(fc)]
             cmd += ["-map", vmap, "-map", amap or "0:a:0?"]
+            if track:
+                from transcriber.subtitle_track import language_code, output_for
+                lang = language_code(language)
+                cmd += ["-map", f"{n_in}:0", "-c:s", output_for(out)[1],
+                        "-metadata:s:s:0", f"language={lang}", "-metadata:s:s:0", "title=Captions",
+                        "-disposition:s:0", "default"]
             cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "192k",
                     "-movflags", "+faststart"]
         else:
@@ -442,20 +491,27 @@ class ReviewMixin:
         cmd.append(out)
         return cmd
 
-    def _export_clip(self, source, a, b, out, video, plan, sources=None):
+    def _export_clip(self, source, a, b, out, video, plan, sources=None, mode="burn", highlight=False):
+        """mode: "track" (a subtitle track inside the clip), "burn" (drawn on the picture), "both", "off".
+        highlight: the burned-in captions color each word as it's said."""
         self.status_var.set(f"Exporting the clip ({_fmt(a)} to {_fmt(b)})...")
         self._busy(True, "Exporting clip")
 
         def work():
             tmp = tempfile.mkdtemp(prefix="wt_clip_")
-            srt = None
-            caps = self.captions_between(self.timed_captions(plan), a, b) if plan else None
-            if video and caps:
-                Path(tmp, "clip.srt").write_text(self._srt(caps), encoding="utf-8")
-                srt = "clip.srt"
-            style = (f"FontName={CAPTION_FONT},FontSize=15,BorderStyle=3,Outline=6,Shadow=0,"
-                     "OutlineColour=&H99000000,PrimaryColour=&H00FFFFFF,MarginV=22")
-            cmd = self.clip_command(source, a, b, str(Path(out).resolve()), video, sources, srt, style)
+            srt = track = None
+            caps = self.caption_cues(plan, source if video else None, a, b) if plan else None
+            if video and caps and mode in ("track", "both"):
+                from transcriber.captions import to_srt
+                Path(tmp, "clip.srt").write_text(to_srt(caps, offset=a), encoding="utf-8")
+                track = "clip.srt"
+            if video and caps and mode in ("burn", "both"):
+                # Burned in with the look from Settings > Captions (size, color, box, speaker colors).
+                Path(tmp, "clip.ass").write_text(self._ass_text(caps, a, highlight), encoding="utf-8")
+                srt = "clip.ass"
+            style = ""
+            cmd = self.clip_command(source, a, b, str(Path(out).resolve()), video, sources, srt, style, track,
+                                    self._transcript_language())
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, cwd=tmp, creationflags=_NO_WINDOW)
                 tail = r.stderr.strip().splitlines()
@@ -473,6 +529,365 @@ class ReviewMixin:
             self.events.put(("call", lambda: (self._busy(False), self.status_var.set(msg))))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _ass_text(self, caps: list, offset: float = 0.0, highlight: bool = False) -> str:
+        """Captions as an .ass file with the look from Settings > Captions (size, color, box,
+        speaker colors), for burning in. offset: the clip's start (its times count from 0).
+        highlight: each word colored as it's said (the speaker's color, or yellow)."""
+        from transcriber.captions import to_ass
+        from transcriber.player import CAPTION_COLORS, DEFAULT_CAPTIONS, caption_scale
+        st = {**DEFAULT_CAPTIONS, **(self.caption_style or {})}
+        return to_ass(caps, font=CAPTION_FONT, size=caption_scale(st)[0],
+                      color=CAPTION_COLORS.get(st["color"], "#ffffff"),
+                      background=st["background"] if st["background"] in ("box", "solid", "outline", "shadow") else "box",
+                      position=st["position"], speaker=st["speaker"], names=st["names"], offset=offset,
+                      highlight="speaker" if highlight else None)
+
+    # ---------------------------------------------------------------- a video cut from the transcript
+
+    def _meta_bounds(self, meta, order: Optional[dict] = None) -> tuple:
+        """(start, end) seconds of a line: its start to the next line's start on its track, or its
+        last word (plus a little), like _row_bounds but for any line (folded ones too)."""
+        start = float(meta.get("sec", 0))
+        track = meta.get("track") or ""
+        if order is None:
+            order = {}
+        if track not in order:
+            order[track] = sorted(float(m.get("sec", 0)) for m in self._all_row_metas()
+                                  if (m.get("track") or "") == track)
+        import bisect
+        secs = order[track]
+        k = bisect.bisect_right(secs, start)
+        end = secs[k] if k < len(secs) else None
+        wf = meta["files"].get("words")
+        lines = self._words_for(wf) if wf else None
+        if lines and meta["i"] < len(lines) and lines[meta["i"]]:
+            last = lines[meta["i"]][-1][1]
+            end = max(last, start + 0.5) if end is None else min(end, last + 0.4)
+        return start, (end if end is not None else start + 5.0)
+
+    def _cut_spans(self, which: str) -> list:
+        """The (start, end) spans to keep: "marked" (every marker: a stretch, or its line), or
+        "deleted" (everything except the lines deleted and not yet saved)."""
+        from transcriber.cuts import keep_from_drop, merge_spans
+        from transcriber.markers_ui import read_markers
+        order: dict = {}
+        duration = float(getattr(self.player, "length", 0) or 0) or None
+        if which == "marked":
+            spans = []
+            f = getattr(self, "_marker_file", None)
+            metas = [m for m in self._all_row_metas() if not self._is_deleted(m)]
+            for m in read_markers(f) if f else []:
+                t = float(m.get("time", -1))
+                if m.get("end"):
+                    spans.append((t, float(m["end"])))
+                    continue
+                hit = next((x for x in metas if abs(float(x.get("sec", 0)) - t) <= 1.01
+                            and (x.get("track") or "") == (m.get("track") or "")
+                            and (not m.get("text") or m["text"].strip() == (x.get("orig") or "").strip())), None)
+                if hit is not None:
+                    spans.append(self._meta_bounds(hit, order))
+                elif t >= 0:
+                    spans.append((t, t + 5.0))
+            return merge_spans(spans, 0.0, duration)
+        drop = [self._meta_bounds(m, order) for m in self._all_row_metas() if self._is_deleted(m)]
+        if not duration:
+            ends = [b for _a, b in drop] + [float(m.get("sec", 0)) + 5 for m in self._all_row_metas()]
+            duration = max(ends) if ends else 0.0
+        return keep_from_drop(drop, duration) if drop else []
+
+    def _cut_dialog(self):
+        """Export a video cut from the transcript: only the marked parts, or without the deleted lines."""
+        from transcriber.cuts import merge_spans, total
+        item = self._shown_item()
+        source = item.get("source") if item else None
+        if not source or not os.path.exists(source):
+            self.status_var.set("The original file is needed to cut a video, and it isn't here.")
+            return
+        video = Path(source).suffix.lower() not in AUDIO_EXTENSIONS and not getattr(self.player, "_is_audio_file", False)
+        marked, deleted = self._cut_spans("marked"), self._cut_spans("deleted")
+        n_del = sum(1 for m in self._all_row_metas() if self._is_deleted(m))
+        if not marked and not n_del:
+            self.status_var.set("Mark the parts to keep (M on a line, or mark a selection), or delete the lines "
+                                "to leave out, then export the cut video.")
+            return
+        win = tk.Toplevel(self)
+        win.title("Cut video")
+        win.transient(self)
+        win.resizable(False, False)
+        f = ttk.Frame(win, padding=(22, 18))
+        f.pack(fill="both", expand=True)
+        head = ttk.Frame(f)
+        head.pack(anchor="w", pady=(0, 10))
+        ttk.Label(head, text="Cut " + ("video" if video else "audio"), font=ui_font(12, bold=True)).pack(side="left")
+        info_icon(head, self, "A new file made of parts of the original, joined together, with the captions "
+                              "moved to match. The original is never touched.").pack(side="left", padx=6)
+        which = tk.StringVar(value="marked" if marked else "deleted")
+
+        def label(kind):
+            if kind == "marked":
+                return f"Keep only the marked parts  ({len(marked)} part{'s' if len(marked) != 1 else ''}, {_fmt(total(marked))})"
+            return f"Leave out the deleted lines  ({n_del} line{'s' if n_del != 1 else ''} out, {_fmt(total(deleted))} kept)"
+        for kind, spans in (("marked", marked), ("deleted", deleted)):
+            ttk.Radiobutton(f, text=label(kind), value=kind, variable=which,
+                            state="normal" if spans else "disabled").pack(anchor="w")
+        pr = ttk.Frame(f)
+        pr.pack(anchor="w", pady=(10, 0))
+        ttk.Label(pr, text="Keep").pack(side="left")
+        pad_var = tk.StringVar(value="0.3")
+        ttk.Spinbox(pr, from_=0.0, to=5.0, increment=0.1, textvariable=pad_var, width=5, justify="right").pack(side="left", padx=6)
+        ttk.Label(pr, text="s around each part").pack(side="left")
+        info_icon(pr, self, "A little room before and after each part, so words aren't clipped. Parts that "
+                            "touch are joined.").pack(side="left", padx=4)
+        caps_var = tk.StringVar(value=(self.caption_style or {}).get("clip_captions") or "both" if video else "off")
+        cr = ttk.Frame(f)
+        cr.pack(anchor="w", pady=(12, 0))
+        hdr = ttk.Frame(cr)
+        hdr.pack(anchor="w")
+        ttk.Label(hdr, text="Captions").pack(side="left")
+        info_icon(hdr, self, "Like Export clip: burned into the picture, a subtitle track inside the file "
+                             "(VLC, TVs, YouTube; not Microsoft's Media Player), both, or none.").pack(side="left", padx=4)
+        for value, text in (("both", "Burned in + subtitle track"), ("burn", "Burned in"),
+                            ("track", "Subtitle track only"), ("off", "None")):
+            ttk.Radiobutton(cr, text=text, value=value, variable=caps_var,
+                            state="normal" if video else "disabled").pack(anchor="w", padx=(10, 0))
+        hl_var = tk.BooleanVar(value=bool((self.caption_style or {}).get("clip_highlight")))
+        ttk.Checkbutton(cr, text="Highlight each word as it's said", variable=hl_var,
+                        state="normal" if video else "disabled").pack(anchor="w", pady=(6, 0))
+        sound = self._clip_sound_options(item, source)
+        sound_vars = []
+        if sound:
+            sb = ttk.Frame(f)
+            sb.pack(anchor="w", pady=(12, 0))
+            ttk.Label(sb, text="Sound").pack(anchor="w")
+            for opt in sound:
+                v = tk.BooleanVar(value=opt["on"])
+                ttk.Checkbutton(sb, text=opt["label"], variable=v).pack(anchor="w", padx=(10, 0))
+                sound_vars.append((opt, v))
+        status = ttk.Label(f, text="", style="Muted.TLabel")
+        status.pack(anchor="w", pady=(8, 0))
+        buttons = ttk.Frame(f)
+        buttons.pack(fill="x", pady=(14, 0))
+
+        def go():
+            try:
+                pad = max(float(pad_var.get()), 0.0)
+            except ValueError:
+                status.configure(text="The room around each part should be a number of seconds.")
+                return
+            duration = float(getattr(self.player, "length", 0) or 0) or None
+            spans = merge_spans(marked if which.get() == "marked" else deleted, pad, duration)
+            if not spans:
+                status.configure(text="Nothing to keep.")
+                return
+            picked = [o for o, v in sound_vars if v.get()]
+            if sound_vars and not picked:
+                status.configure(text="Pick at least one sound to include.")
+                return
+            ext = ".mp4" if video else ".mp3"
+            base = item["key"]
+            default = f"{base} ({'highlights' if which.get() == 'marked' else 'cut'}){ext}"
+            folder = Path(self._current_version(item)["files"].get("txt") or source).parent
+            out = filedialog.asksaveasfilename(parent=win, title="Save the cut " + ("video" if video else "audio"),
+                                               initialdir=str(folder), initialfile=default, defaultextension=ext,
+                                               filetypes=[(ext.lstrip(".").upper(), "*" + ext)])
+            if not out:
+                return
+            if os.path.normcase(os.path.abspath(out)) == os.path.normcase(os.path.abspath(source)):
+                status.configure(text="Pick another name: the original is never replaced.")
+                return
+            mode = caps_var.get() if video else "off"
+            plan = self._caption_plan() if mode != "off" else None
+            if video:
+                self.caption_style = {**(self.caption_style or {}), "clip_captions": mode,
+                                      "clip_highlight": bool(hl_var.get())}
+                from transcriber.ui_common import save_settings
+                save_settings(self._settings())
+            win.destroy()
+            self._export_cut(source, spans, out, video, plan, picked or None, mode, bool(hl_var.get()))
+
+        ttk.Button(buttons, text="Export", style="Accent.TButton", command=go).pack(side="right")
+        ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side="right", padx=(0, 8))
+        win.bind("<Return>", lambda e: go())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_reqwidth()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - win.winfo_reqheight()) // 3
+        win.geometry(f"+{x}+{y}")
+        set_dark_titlebar(win, self.current_theme == "dark")
+        win.grab_set()
+
+    def _export_cut(self, source, spans, out, video, plan, sources=None, mode="both", highlight=False):
+        """Each span exported like a clip (same encoding), the parts joined without re-encoding,
+        and the captions put inside as a track with the gaps taken out of their times."""
+        from transcriber import captions as C
+        from transcriber.cuts import concat_command, concat_list, remap_cues, total
+        n = len(spans)
+        self.status_var.set(f"Cutting: {n} part{'s' if n != 1 else ''}, {_fmt(total(spans))} in all...")
+        self._busy(True, "Cutting video")
+        language = self._transcript_language()
+
+        def say(msg):
+            self.events.put(("call", lambda: self.status_var.set(msg)))
+
+        def work():
+            tmp = tempfile.mkdtemp(prefix="wt_cut_")
+            err = ""
+            try:
+                cues = []
+                if plan:
+                    say("Lining the captions up with the voice...")
+                    cues = C.build(self.timed_lines(plan))
+                parts = []
+                for k, (a, b) in enumerate(spans, 1):
+                    say(f"Exporting part {k} of {n} ({_fmt(a)} to {_fmt(b)})...")
+                    srt = None
+                    if video and cues and mode in ("burn", "both"):
+                        caps = C.between(cues, a, b)
+                        if caps:
+                            Path(tmp, f"part{k}.ass").write_text(self._ass_text(caps, a, highlight), encoding="utf-8")
+                            srt = f"part{k}.ass"
+                    part = str(Path(tmp, f"part{k}{'.mp4' if video else '.mp3'}"))
+                    cmd = self.clip_command(source, a, b, part, video, sources, srt, "")
+                    r = subprocess.run(cmd, capture_output=True, text=True, cwd=tmp, creationflags=_NO_WINDOW)
+                    if r.returncode:
+                        tail = r.stderr.strip().splitlines()
+                        err = (tail[-1] if tail else f"ffmpeg stopped (code {r.returncode})")
+                        break
+                    parts.append(part)
+                if not err:
+                    say("Joining the parts...")
+                    Path(tmp, "parts.txt").write_text(concat_list(parts), encoding="utf-8")
+                    track = video and cues and mode in ("track", "both")
+                    joined = str(Path(tmp, "joined.mp4")) if track else str(Path(out).resolve())
+                    cmd = concat_command(str(Path(tmp, "parts.txt")), joined, video)
+                    r = subprocess.run(cmd, capture_output=True, text=True, cwd=tmp, creationflags=_NO_WINDOW)
+                    if r.returncode:
+                        tail = r.stderr.strip().splitlines()
+                        err = (tail[-1] if tail else f"ffmpeg stopped (code {r.returncode})")
+                    elif track:
+                        from transcriber.subtitle_track import mux_command
+                        moved = remap_cues(cues, spans)
+                        Path(tmp, "cut.srt").write_text(C.to_srt(moved), encoding="utf-8")
+                        cmd = mux_command(joined, str(Path(tmp, "cut.srt")), str(Path(out).resolve()), language)
+                        r = subprocess.run(cmd, capture_output=True, text=True, cwd=tmp, creationflags=_NO_WINDOW)
+                        if r.returncode:
+                            tail = r.stderr.strip().splitlines()
+                            err = (tail[-1] if tail else f"ffmpeg stopped (code {r.returncode})")
+            except Exception as exc:
+                err = str(exc)
+            finally:
+                try:
+                    for p in Path(tmp).iterdir():
+                        p.unlink()
+                    os.rmdir(tmp)
+                except OSError:
+                    pass
+            msg = (f"Couldn't cut the video: {err}" if err
+                   else f"Saved {Path(out).name}: {n} part{'s' if n != 1 else ''}, {_fmt(total(spans))}.")
+            self.events.put(("call", lambda: (self._busy(False), self.status_var.set(msg))))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------------------------------------------------------------- the video with a subtitle track
+
+    def _transcript_language(self) -> str:
+        """The language the shown transcript was made in ("" when unknown), for subtitle tracks."""
+        for _k, files in getattr(self, "_stats_parts", []):
+            if files.get("speakers"):
+                from transcriber.speakers import read_speakers_file
+                language = (read_speakers_file(files["speakers"]) or {}).get("language", "")
+                if language:
+                    return language
+        return ""
+
+    def _save_with_captions(self):
+        """Save a copy of the shown transcript's video with the captions inside it as a subtitle
+        track (players and TVs list it under Subtitles / CC). Nothing is re-encoded."""
+        from transcriber import subtitle_track as st
+        from transcriber.core import has_video_stream, media_duration
+        if not self.display or self.display[0] != "saved":
+            self.status_var.set("Pick a transcript first.")
+            return
+        item = self._shown_item() or {}
+        source = getattr(self.player, "path", None) or item.get("source")
+        if not source or not os.path.exists(source):
+            self.status_var.set("Can't find the video this transcript came from.")
+            return
+        if Path(source).suffix.lower() in AUDIO_EXTENSIONS or not has_video_stream(source):
+            self.status_var.set("This is an audio file: a subtitle track needs a video.")
+            return
+        if self._edits:
+            if not self._confirm(title="Save changes?", heading="Save your changes first?", body="", items=[],
+                                 detail="The video gets the saved transcript, so your unsaved edits are saved "
+                                        "first.", confirm="Save and continue"):
+                return
+            if not self._edit_save():
+                return
+        ext, _codec = st.output_for(source)
+        kind = {".mkv": "MKV video", ".mp4": "MP4 video", ".m4v": "M4V video", ".mov": "QuickTime video"}[ext]
+        out = filedialog.asksaveasfilename(parent=self, title="Save video with captions",
+                                           initialdir=str(Path(source).parent), initialfile=st.default_name(source),
+                                           defaultextension=ext, filetypes=[(kind, "*" + ext)])
+        if not out:
+            return
+        if os.path.normcase(os.path.abspath(out)) == os.path.normcase(os.path.abspath(source)):
+            self.status_var.set("Pick another name: the original video is never replaced.")
+            return
+        plan = self._caption_plan()
+        language = self._transcript_language()
+        self.status_var.set("Saving the video with captions (lining them up with the voice)...")
+        self._busy(True, "Saving video with captions")
+
+        def work():
+            from transcriber.captions import to_srt
+            err, n = "", 0
+            tmp = tempfile.mkdtemp(prefix="wt_subs_")
+            part = st.part_path(out)
+            try:
+                caps = self.caption_cues(plan, source)
+                n = len(caps)
+                if not caps:
+                    err = "this transcript has no lines"
+                else:
+                    srt = os.path.join(tmp, "captions.srt")
+                    Path(srt).write_text(to_srt(caps), encoding="utf-8")
+                    duration = media_duration(source)
+
+                    def progress(f):
+                        self.events.put(("call", lambda: self.status_var.set(
+                            f"Saving the video with captions... {int(f * 100)}%")))
+                    err = st.run(st.mux_command(source, srt, part, language), duration, progress)
+                    if not err:
+                        os.replace(part, out)
+            except Exception as exc:
+                err = str(exc)
+            finally:
+                for f in Path(tmp).glob("*"):
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+                try:
+                    os.rmdir(tmp)
+                except OSError:
+                    pass
+            self.events.put(("call", lambda: (self._busy(False), self._saved_with_captions(out, n, err))))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _saved_with_captions(self, out, n, err):
+        if err:
+            self.status_var.set(f"Couldn't save the video with captions: {err}")
+            return
+        self.status_var.set(f"Saved {Path(out).name} with {n} captions on a subtitle track.")
+        if self._confirm(title="Saved", heading="Video saved with captions",
+                         body=str(Path(out).parent) + ":", items=[Path(out).name],
+                         detail="The captions are a subtitle track: in VLC, on a TV or in Plex, turn them on or "
+                                "off from the Subtitles / CC menu. They show by default.",
+                         confirm="Show in folder", cancel="OK"):
+            from transcriber.ui_common import show_in_folder
+            show_in_folder(Path(out))
 
     # ---------------------------------------------------------------- line up times with the voice
 

@@ -10,6 +10,7 @@ import bisect
 import os
 import sys
 import tkinter as tk
+from tkinter import font as tkfont
 from pathlib import Path
 from tkinter import ttk
 from typing import Callable, Optional
@@ -30,9 +31,30 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma"}
 CaptionSource = Callable[[], list]
 
 
-DEFAULT_CAPTIONS = {"mode": "below", "size": "medium", "background": "box", "color": "white",
-                    "position": "bottom", "names": True}
+DEFAULT_CAPTIONS = {"mode": "below", "size": 100, "background": "box", "color": "white",
+                    "position": "bottom", "names": True, "split": True, "cuts": True, "sounds": False,
+                    "overlap": "layer",
+                    "speaker": "name"}
 CAPTION_SIZES = {"small": (0.045, 10), "medium": (0.055, 11), "large": (0.07, 13), "xlarge": (0.09, 16)}
+SIZE_PERCENTS = (50, 75, 100, 150, 200, 300, 400)              # caption size choices, like YouTube's
+_OLD_SIZES = {"small": 75, "medium": 100, "large": 150, "xlarge": 200}
+
+
+def size_percent(style: dict) -> int:
+    """The caption size as a percent of normal (older settings said small / medium / large)."""
+    v = (style or {}).get("size", 100)
+    if isinstance(v, str):
+        v = _OLD_SIZES.get(v, v.rstrip("%"))
+    try:
+        return min(max(int(v), 25), 400)
+    except (TypeError, ValueError):
+        return 100
+
+
+def caption_scale(style: dict) -> tuple:
+    """(height of on-video text as a share of the picture, font size of the strip below) for a style."""
+    pct = size_percent(style) / 100
+    return 0.055 * pct, max(round(11 * pct), 6)
 CAPTION_COLORS = {"white": "#ffffff", "yellow": "#ffe14d", "gray": "#d6d6d6"}
 
 
@@ -94,6 +116,7 @@ class Player(ttk.Frame):
         self.length = 0.0
         self._dragging = False
         self._was_playing = False
+        self._stop_at = None                   # play_range: pause when playback reaches this time
         # Audio tracks: [{"n", "name", "transcribed"}]. VLC plays one track per player, so the first
         # track that's on plays with the video and each other one gets its own hidden audio player.
         self.tracks: list[dict] = []
@@ -105,11 +128,16 @@ class Player(ttk.Frame):
         self.on_focus_changed: Optional[Callable[[Optional[str]], None]] = None
         self._track_applied = True
         self._priming = False
+        self.on_caption_edit: Optional[Callable[[tuple], None]] = None   # double-click on a caption
 
         self.screen = tk.Frame(self, background="black", height=200)
         self.screen.pack(fill="x")
         self.screen.pack_propagate(False)
         self.bind("<Configure>", self._keep_16_by_9)
+        # VLC draws into this inner panel. Hiding it hides VLC's own video window too, which on
+        # Windows would otherwise sit on top of the call tiles (Audio only) whatever Tk stacks above.
+        self.surface = tk.Frame(self.screen, background="black")
+        self.surface.place(relx=0, rely=0, relwidth=1, relheight=1)
 
         # Shown on top of the black screen when there's no video picture (no file, audio file, errors).
         self.overlay = tk.Label(self.screen, background="black", foreground="#bdbdbd",
@@ -184,11 +212,13 @@ class Player(ttk.Frame):
         else:
             self._set_controls("disabled")
             self.overlay.configure(text="Select a file to preview it here")
-        for w in (self.screen, self.overlay, self.caption):
+        for w in (self.screen, self.surface, self.overlay, self.caption):
             w.bind("<Button-1>", lambda e: self.toggle())
-        for w in (self.screen, self.overlay, self.call, self.caption):
+        for w in (self.screen, self.surface, self.overlay, self.call, self.caption):
             w.bind(RIGHT_CLICK, self._video_menu)
-        self.screen.bind("<Double-Button-1>", lambda e: self.toggle_fullscreen())
+        for w in (self.screen, self.surface):
+            w.bind("<Double-Button-1>", self._video_double)
+        self.caption.bind("<Double-Button-1>", lambda e: self._edit_caption())
         self._make_fs_button()
         self._tick()
         self._hover_check()
@@ -197,7 +227,7 @@ class Player(ttk.Frame):
 
     def _attach(self, surface=None):
         """Hand a black frame to VLC as its drawing surface (the preview area, or fullscreen)."""
-        wid = (surface or self.screen).winfo_id()
+        wid = (surface or self.surface).winfo_id()
         if sys.platform == "win32":
             self.mp.set_hwnd(wid)
         elif sys.platform == "darwin":
@@ -209,8 +239,13 @@ class Player(ttk.Frame):
 
     max_screen_h = 10_000       # the app lowers this so a wide window doesn't make the video too tall
 
+    fill_height = False         # True: the picture area takes all the height it's given (letterboxed)
+
+    def fit_screen(self):
+        self._keep_16_by_9(type("E", (), {"width": self.winfo_width()})())
+
     def _keep_16_by_9(self, event):
-        h = max(min(int(event.width * 9 / 16), self.max_screen_h), 120)
+        h = max(self.max_screen_h if self.fill_height else min(int(event.width * 9 / 16), self.max_screen_h), 120)
         if abs(int(self.screen.cget("height")) - h) > 2:
             self.screen.configure(height=h)
         self.overlay.configure(wraplength=max(event.width - 40, 100))
@@ -259,6 +294,7 @@ class Player(ttk.Frame):
     def load(self, path: Optional[str], captions: Optional[CaptionSource] = None, note: str = ""):
         """Show this file (or clear with None). Keeps playing position if it's the same file."""
         self.captions = captions or (lambda: [])
+        self.display_captions = None     # caption-sized pieces to show, when set (see saved_ui)
         if not self.available:
             return
         if path == self.path:
@@ -324,13 +360,23 @@ class Player(ttk.Frame):
         audio = getattr(self, "_is_audio_file", False) or self.audio_only_view
         self._tiles = tiles if audio else []
         self._call_active = "redraw"
-        if self._tiles and self.path:
+        self._caption_shown = "redraw"         # captions may move between the picture and the strip below
+        # A video in the Audio only view with no one to show: the file's name on the same dark panel
+        # (a panel the video can't paint over, unlike a label on top of it).
+        self._note_view = bool(self.path and self.audio_only_view and not self._tiles
+                               and not getattr(self, "_audio_cover", False)
+                               and not getattr(self, "_is_audio_file", False))
+        if (self._tiles or self._note_view) and self.path:
             self.overlay.place_forget()
+            self.surface.place_forget()            # takes VLC's video window out of sight
             self.call.place(relx=0, rely=0, relwidth=1, relheight=1)
             tk.Misc.lift(self.call)
             self._draw_call(force=True)
         else:
             self.call.place_forget()
+            if not self.surface.winfo_manager():
+                self.surface.place(relx=0, rely=0, relwidth=1, relheight=1)
+                tk.Misc.lower(self.surface)
             if self.path and self.audio_only_view and not getattr(self, "_audio_cover", False):
                 self.overlay.configure(text="\u266a\n" + Path(self.path).name, font=ui_font(13))
                 self._cover(True)
@@ -339,6 +385,9 @@ class Player(ttk.Frame):
             elif self.path:
                 self._cover(False)
         self._layout_caption()
+        self.refresh_captions()
+        if self.available and self.path:
+            self._show_caption(self._captions_at(max(self.mp.get_time() / 1000, 0)))
         on = self.audio_only_view
         audio_file = getattr(self, "_is_audio_file", False) or getattr(self, "_audio_cover", False)
         self.view_btn.configure(text=glyph(self, "videoview" if on else "audioview"),
@@ -361,11 +410,32 @@ class Player(ttk.Frame):
         menu.add_checkbutton(label="Audio only", variable=self._audio_only_var, command=self.toggle_audio_only)
         if not getattr(self, "_audio_cover", False) and not self._tiles:
             menu.add_command(label="Fullscreen", command=self.toggle_fullscreen)
+        # Caption size, right here while watching (also in Settings > Captions)
+        sizes = tk.Menu(menu, tearoff=0, background=menu.cget("background"), foreground=menu.cget("foreground"),
+                        activebackground=menu.cget("activebackground"), activeforeground=menu.cget("activeforeground"),
+                        selectcolor=menu.cget("selectcolor"), font=ui_font(10), relief="flat", borderwidth=1)
+        self._size_var = tk.IntVar(value=size_percent(self.cap_style))
+        for pct in SIZE_PERCENTS:
+            sizes.add_radiobutton(label=f"{pct}%", variable=self._size_var, value=pct,
+                                  command=lambda p=pct: self._pick_caption_size(p))
+        menu.add_separator()
+        menu.add_cascade(label="Caption size", menu=sizes)
+        if self.on_save_with_captions and not getattr(self, "_audio_cover", False):
+            menu.add_command(label="Save video with captions...", command=self.on_save_with_captions)
         try:
             menu.tk_popup(e.x_root, e.y_root)
         finally:
             menu.grab_release()
         return "break"
+
+    on_caption_size: Optional[Callable[[int], None]] = None     # the app saves the choice
+    on_save_with_captions: Optional[Callable[[], None]] = None   # a copy with a subtitle track
+
+    def _pick_caption_size(self, pct: int):
+        if self.on_caption_size:
+            self.on_caption_size(pct)
+        else:
+            self.set_caption_style({**self.cap_style, "size": pct})
 
     def _call_img(self, tile, size: int, gray: bool):
         key = (tile["name"], size, gray, self._call_shape)
@@ -384,16 +454,22 @@ class Player(ttk.Frame):
         return self._call_imgs[key]
 
     def _draw_call(self, force: bool = False):
-        if not self._tiles or not self.call.winfo_ismapped():
+        if not (self._tiles or getattr(self, "_note_view", False)) or not self.call.winfo_ismapped():
             return
         cap = self._caption_at(max(self.mp.get_time() / 1000, 0)) if (self.available and self.path) else None
-        active = cap[2] if cap and len(cap) > 3 and cap[2] else None
+        # Who is talking: the speaker's name, or (no speakers, separate tracks) the line's track.
+        active = (cap[2] if len(cap) > 3 and cap[2] else cap[4] if len(cap) > 4 and cap[4] else None) if cap else None
         if active == self._call_active and not force:
             return
         self._call_active = active
         c = self.call
         c.delete("all")
         w, h = max(c.winfo_width(), 50), max(c.winfo_height(), 50)
+        if not self._tiles:
+            c.create_text(w / 2, h / 2 - 14, text="\u266a", fill="#9a9a9a", font=ui_font(22))
+            c.create_text(w / 2, h / 2 + 18, text=Path(self.path).name if self.path else "", fill="#d0d0d0",
+                          font=ui_font(11), width=max(w - 40, 50), justify="center")
+            return
         n = len(self._tiles)
         cols = 1 if n == 1 else 2 if n <= 4 else 3
         rows = (n + cols - 1) // cols
@@ -406,7 +482,7 @@ class Player(ttk.Frame):
             if r == rows - 1 and n % cols:            # center an unfinished last row
                 x0 += (cols - n % cols) * (tw + gap) / 2
             y0 = gap + r * (th + gap)
-            talking = tile["name"] == active
+            talking = tile.get("track", tile["name"]) == active
             dim = active is not None and not talking
             outline = _lighten(tile["color"], 0.15) if talking else "#262626"
             self._round_rect(x0, y0, x0 + tw, y0 + th, 10, fill="#151515" if not talking else "#1c1c1c",
@@ -463,6 +539,7 @@ class Player(ttk.Frame):
         self._apply_track()
         self._sync_extras()
         self._caption_shown = "redraw"
+        self.refresh_captions()
         if self.on_tracks_changed:
             self.on_tracks_changed(self.muted_names())
 
@@ -661,10 +738,14 @@ class Player(ttk.Frame):
                 pass
         self._extras = {}
 
-    def seek(self, seconds: float, play: bool = True):
+    def seek(self, seconds: float, play: bool = True, quick: bool = False):
+        """Jump there. quick: scrubbing (many jumps a second): the frame and captions update, the
+        extra players catch up once the scrubbing settles."""
         if not self.available or not self.path:
             return
         self._end_priming()
+        if not quick:
+            self._stop_at = None
         state = self.mp.get_state()
         if state in (vlc.State.Ended, vlc.State.Stopped, vlc.State.NothingSpecial, vlc.State.Error):
             self.mp.play()
@@ -679,11 +760,55 @@ class Player(ttk.Frame):
             self.mp.set_time(int(seconds * 1000))
             if play and not self.mp.is_playing():
                 self.mp.play()
-            self.after(100, lambda: self._follow_extras(force=True))
+            self._follow_soon(force=True)
+        if quick:                              # the captions for that spot now, not at the next tick
+            try:
+                self._show_caption(self._captions_at(max(seconds, 0.0)))
+                self.time_var.set(f"{fmt_time(seconds)} / {fmt_time(self.length)}")
+                if self.length and not self._dragging:
+                    self.scale.set(seconds / self.length)
+            except Exception:
+                pass
+
+    def _follow_soon(self, force: bool = False):
+        """The extra players catch up with the video a moment later (one catch-up for a burst of jumps)."""
+        if not self._extras:
+            return
+        if getattr(self, "_follow_job", None) is not None:
+            self.after_cancel(self._follow_job)
+        self._follow_job = self.after(120, lambda: (setattr(self, "_follow_job", None), self._follow_extras(force=force)))
+
+    def play_range(self, start: float, end: float):
+        """Play from start and pause at end (a stretch marked on the timeline), captions and all."""
+        if not self.available or not self.path or end <= start:
+            return
+        self.seek(start, play=True)
+        self._stop_at = float(end)
+        if getattr(self, "_range_job", None) is None:
+            self._range_job = self.after(50, self._range_watch)
+
+    def _range_watch(self):
+        self._range_job = None
+        end = getattr(self, "_stop_at", None)
+        if end is None or not self.available or not self.path:
+            return
+        try:
+            t = self.mp.get_time() / 1000
+            if self.mp.is_playing() and t >= end - 0.03:
+                self.mp.set_pause(1)
+                self.mp.set_time(int(end * 1000))
+                self._stop_at = None
+                self._follow_soon(force=True)
+                return
+        except Exception:
+            self._stop_at = None
+            return
+        self._range_job = self.after(50, self._range_watch)
 
     def toggle(self):
         if not self.available or not self.path:
             return
+        self._stop_at = None                   # (a marked stretch was playing: carry on past it)
         if self._priming:  # still showing the first frame: treat as "play"
             self._end_priming()
             self.mp.set_pause(0)
@@ -756,7 +881,7 @@ class Player(ttk.Frame):
         self.scale.set(frac)
         t = frac * self.length
         self.time_var.set(f"{fmt_time(t)} / {fmt_time(self.length)}")
-        self._show_caption(self._caption_at(t))
+        self._show_caption(self._captions_at(t))
         return "break"
 
     def _drag_end(self, e):
@@ -768,21 +893,37 @@ class Player(ttk.Frame):
         self.seek(frac * self.length, play=self._was_playing)
         return "break"
 
-    def _caption_at(self, t: float):
-        """The caption at time t: a caption tuple (start, text[, name, color]) or None."""
-        caps = self.captions()
+    def _captions_at(self, t: float) -> list:
+        """Every caption showing at time t, lowest spot first: tuples (start, text[, name, color,
+        track, end, layer]). People talking at once each have one, stacked by layer."""
+        caps = (getattr(self, "display_captions", None) or self.captions)()
         muted = self.muted_names()
         if muted:
             caps = [c for c in caps if not (len(c) > 4 and c[4] in muted)]
         if not caps:
-            return None
+            return []
         starts = [c[0] for c in caps]
         i = bisect.bisect_right(starts, t) - 1
         if i < 0:
-            return None
+            return []
+        if len(caps[i]) > 5:                     # captions with their own end times
+            found = [c for c in caps[max(i - 6, 0):i + 1] if len(c) > 5 and c[0] <= t < c[5]]
+            seen, out = set(), []
+            for c in sorted(found, key=lambda c: (c[6] if len(c) > 6 else 0, c[0])):
+                layer = c[6] if len(c) > 6 else 0
+                if layer in seen:
+                    continue                     # one per spot
+                seen.add(layer)
+                out.append(c)
+            return out
         start = caps[i][0]
         nxt = caps[i + 1][0] if i + 1 < len(caps) else start + 6
-        return caps[i] if t < min(nxt, start + 10) else None
+        return [caps[i]] if t < min(nxt, start + 10) else []
+
+    def _caption_at(self, t: float):
+        """The main caption at time t (the one in the usual spot), or None."""
+        caps = self._captions_at(t)
+        return caps[0] if caps else None
 
     # ---------------------------------------------------------------- captions
 
@@ -795,31 +936,213 @@ class Player(ttk.Frame):
         t.tag_configure("center", justify="center")
         return t
 
-    def _show_caption(self, cap):
-        key = tuple(cap[1:]) if cap else None
+    def _show_caption(self, caps):
+        """Show the captions for this moment: one tuple, a list of them (people at once, stacked
+        from the usual spot up), or None."""
+        if caps and not isinstance(caps, list):
+            caps = [caps]
+        caps = caps or []
+        if getattr(self, "_capedit", None) is not None:
+            return                                 # being typed on: the editor stays as it is
+        key = tuple(tuple(c[1:]) for c in caps) if caps else None
         if key == self._caption_shown:
             return
         self._caption_shown = key
         names = self.cap_style.get("names", True)
+        speaker = self.cap_style.get("speaker", "name")
         if self._overlay_on():
-            text = ""
-            if cap:
-                text = (f"{cap[2]}:  " if names and len(cap) > 3 and cap[2] else "") + cap[1]
-            self._marquee(text)
+            if self._boxwin_on():              # the app draws this style itself, over the video
+                self._marquee("")
+                self._show_boxwin(caps)
+                return
+            self._show_boxwin(None)
+            # VLC draws one block of text: the stacked captions go on their own lines, top one first
+            lines = []
+            for cap in sorted(caps, key=lambda c: -(c[6] if len(c) > 6 else 0)):
+                lines.append((f"{cap[2]}:  " if names and len(cap) > 3 and cap[2] else "") + cap[1])
+            main = caps[0] if caps else None
+            spk = main[3] if main and len(main) > 3 and main[3] else ""
+            self._marquee_color(spk if speaker == "text" and spk and len(caps) == 1 else None)
+            self._marquee("\n".join(lines))
             return
+        self._show_boxwin(None)
         boxes = [self.caption] + ([self._fs[2]] if self._fs else [])
+        from transcriber.captions import contrast_text
         for box in boxes:
             box.configure(state="normal")
             box.delete("1.0", "end")
-            if cap:
+            box.configure(height=max(2, 2 * len(caps)) if caps else 2)
+            for n, cap in enumerate(sorted(caps, key=lambda c: -(c[6] if len(c) > 6 else 0))):
+                if n:
+                    box.insert("end", "\n", "center")
                 text = cap[1]
-                if names and len(cap) > 3 and cap[2]:
-                    color = _lighten(cap[3])
-                    tag = "n" + color.lstrip("#")
-                    box.tag_configure(tag, foreground=color)
-                    box.insert("end", cap[2] + ":  ", ("center", tag))
-                box.insert("end", text, "center")
+                spk = cap[3] if len(cap) > 3 and cap[3] else ""
+                if speaker == "box" and spk:         # a box in the speaker's color behind the words
+                    tag = "b" + spk.lstrip("#")
+                    box.tag_configure(tag, background=spk, foreground=contrast_text(spk))
+                    label = f"{cap[2]}:  " if names and cap[2] else ""
+                    box.insert("end", f"\u2002{label}{text}\u2002", ("center", tag))
+                else:
+                    if names and len(cap) > 3 and cap[2]:
+                        color = _lighten(cap[3])
+                        tag = "n" + color.lstrip("#")
+                        box.tag_configure(tag, foreground=color)
+                        box.insert("end", cap[2] + ":  ", ("center", tag))
+                    if speaker == "text" and spk:
+                        tag = "t" + _lighten(spk).lstrip("#")
+                        box.tag_configure(tag, foreground=_lighten(spk))
+                        box.insert("end", text, ("center", tag))
+                    else:
+                        box.insert("end", text, "center")
             box.configure(state="disabled")
+
+    def _marquee_color(self, color):
+        """On-video captions in the speaker's color (None = the chosen text color)."""
+        want = color or CAPTION_COLORS.get(self.cap_style.get("color", "white"), "#ffffff")
+        if getattr(self, "_marq_color", None) == want or not self.available:
+            return
+        try:
+            self.mp.video_set_marquee_int(vlc.VideoMarqueeOption.Color, int(want.lstrip("#"), 16))
+            self._marq_color = want
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------------- on-video captions with a box in the speaker's color
+
+    # VLC's on-video text has one background color for everything, and VLC's subtitle renderer
+    # (libass) crashed on Windows when handed a styled subtitle file. So this style is drawn by the
+    # app: a small borderless window that floats over the video (like the fullscreen button).
+
+    def _boxwin_on(self) -> bool:
+        return self._overlay_on() and self.cap_style.get("speaker") == "box"
+
+    def _cap_window(self, layer: int = 0):
+        """The floating caption box for a spot (0 the usual one; 1, 2 stacked above)."""
+        wins = self.__dict__.setdefault("_capwins", {})
+        if layer not in wins:
+            win = tk.Toplevel(self)
+            win.withdraw()
+            win.overrideredirect(True)
+            try:
+                win.transient(self.winfo_toplevel())
+            except tk.TclError:
+                pass
+            lbl = tk.Label(win, justify="center", padx=10, pady=3, borderwidth=0)
+            lbl.pack()
+            lbl.bind("<Button-1>", lambda e: self.toggle())
+            lbl.bind("<Double-Button-1>", lambda e, layer=layer: self._edit_caption(layer))
+            wins[layer] = (win, lbl)
+        return wins[layer][0]
+
+    def _show_boxwin(self, caps):
+        """Show the captions in their boxes over the video (people at once: one box per spot), or
+        hide them all with None."""
+        from transcriber.captions import contrast_text
+        if caps and not isinstance(caps, list):
+            caps = [caps]
+        self._captext = {}
+        if not caps:
+            for win, _lbl in self.__dict__.get("_capwins", {}).values():
+                win.withdraw()
+            return
+        names = self.cap_style.get("names", True)
+        for cap in caps:
+            layer = cap[6] if len(cap) > 6 and cap[6] else 0
+            self._cap_window(layer)
+            win, lbl = self._capwins[layer]
+            spk = cap[3] if len(cap) > 3 and cap[3] else "#111111"
+            label = f"{cap[2]}:  " if names and len(cap) > 2 and cap[2] else ""
+            self._captext[layer] = (label + str(cap[1]), spk)
+            lbl.configure(text=self._captext[layer][0], background=spk, foreground=contrast_text(spk))
+        for layer, (win, _lbl) in self._capwins.items():
+            if layer not in self._captext and win.winfo_viewable():
+                win.withdraw()
+        self._place_boxwin()
+
+    def _place_boxwin(self):
+        """Keep the caption boxes over the bottom (or top) of the video as the window moves, each
+        spot a caption's height above the one below."""
+        wins = self.__dict__.get("_capwins", {})
+        texts = self.__dict__.get("_captext") or {}
+        if not wins:
+            return
+        if not isinstance(texts, dict):
+            texts = {}
+        target = self._fs[1] if self._fs else self.screen
+        try:
+            owner = self._fs[0] if self._fs else self.winfo_toplevel()
+            if getattr(self, "_capowner", None) is not owner:     # stays just above the window it's on
+                for win, _lbl in wins.values():
+                    win.transient(owner)
+                self._capowner = owner
+            visible = (texts and self._boxwin_on() and target.winfo_viewable()
+                       and self.winfo_toplevel().state() != "iconic")
+            if not visible:
+                for win, _lbl in wins.values():
+                    if win.winfo_viewable():
+                        win.withdraw()
+                return
+            w, h = target.winfo_width(), target.winfo_height()
+            factor = caption_scale(self.cap_style)[0]
+            px = max(int(h * factor * 0.8), 11)
+            font = (CAPTION_FONT, -px, "bold")
+            margin = int(h * 0.05)
+            top = self.cap_style.get("position") == "top"
+            step = 0                                          # where the next spot starts
+            editing = (getattr(self, "_capedit", None) or {}).get("layer")
+            for layer in sorted(texts):
+                win, lbl = wins[layer]
+                if layer == editing:                          # being typed on: the editor is there instead
+                    if win.winfo_viewable():
+                        win.withdraw()
+                    ed = self._capedit["win"]
+                    ed.update_idletasks()
+                    step += ed.winfo_reqheight() + max(int(px * 0.3), 4)
+                    continue
+                if lbl.cget("font") != str(font):
+                    lbl.configure(font=font)
+                lbl.configure(wraplength=int(w * 0.85))
+                win.update_idletasks()
+                rw, rh = win.winfo_reqwidth(), win.winfo_reqheight()
+                x = target.winfo_rootx() + (w - rw) // 2
+                y = target.winfo_rooty() + (margin + step if top else h - rh - margin - step)
+                geo = f"+{x}+{y}"
+                if win.geometry().split("x")[-1].split("+", 1)[-1] != geo[1:] or not win.winfo_viewable():
+                    win.geometry(geo)
+                if not win.winfo_viewable():
+                    win.deiconify()
+                    win.lift(owner)
+                step += rh + max(int(px * 0.3), 4)
+        except tk.TclError:
+            pass
+
+    def refresh_captions(self, force: bool = False):
+        """Captions changed (style, file, muted tracks): show the current one again."""
+        if not self._boxwin_on():
+            self._show_boxwin(None)
+        before = self._caption_shown
+        self._caption_shown = "redraw"
+        if self.available and self.path:
+            self._show_caption(self._captions_at(max(self.mp.get_time() / 1000, 0)))
+            if self._caption_shown != before:
+                self._repaint_paused()
+
+    def _repaint_paused(self):
+        """VLC draws its on-video text only with a new frame: while paused, show the same spot
+        again so a changed caption (an unsaved edit) appears right away."""
+        if not (self._overlay_on() and not self._boxwin_on()) or self._priming:
+            return
+        if getattr(self, "_repaint_job", None):
+            self.after_cancel(self._repaint_job)
+
+        def go():
+            self._repaint_job = None
+            try:
+                if self.mp.get_state() == vlc.State.Paused:
+                    self.mp.set_time(max(int(self.mp.get_time()), 0))
+            except Exception:
+                pass
+        self._repaint_job = self.after(120, go)
 
     # ---------------------------------------------------------------- caption styles
 
@@ -858,12 +1181,15 @@ class Player(ttk.Frame):
         if self.available and self._vlc_args() != old_args:
             self._restart_vlc()
         self._marq_ready = False
+        self._marq_color = None
         self._layout_caption()
         self._caption_shown = "redraw"
-        size = CAPTION_SIZES.get(self.cap_style.get("size", "medium"), CAPTION_SIZES["medium"])[1]
+        self.refresh_captions()
+        size = caption_scale(self.cap_style)[1]
         color = CAPTION_COLORS.get(self.cap_style.get("color", "white"), "#ffffff")
         for box in [self.caption] + ([self._fs[2]] if self._fs else []):
-            box.configure(font=ui_font(size if box is self.caption else size + 6, bold=True), foreground=color)
+            box.configure(font=ui_font(size if box is self.caption else size + 6, bold=True), foreground=color,
+                          height=3 if size_percent(self.cap_style) >= 200 else 2)   # big text: room for more
 
     def _layout_caption(self):
         """The strip under the video only when captions aren't drawn on the video."""
@@ -901,7 +1227,7 @@ class Player(ttk.Frame):
         if not h:
             return
         M = vlc.VideoMarqueeOption
-        factor = CAPTION_SIZES.get(self.cap_style.get("size", "medium"), CAPTION_SIZES["medium"])[0]
+        factor = caption_scale(self.cap_style)[0]
         color = int(CAPTION_COLORS.get(self.cap_style.get("color", "white"), "#ffffff")[1:], 16)
         top = self.cap_style.get("position") == "top"
         self.mp.video_set_marquee_int(M.Enable, 1)
@@ -944,6 +1270,8 @@ class Player(ttk.Frame):
                         self.mp.set_pause(1)
                     self.mp.audio_set_mute(muted)
                     self._sync_extras()
+                    self._marq_color = None
+                    self.refresh_captions(force=True)
                 else:
                     self.after(50, lambda: resume(tries + 1))
             self.after(50, resume)
@@ -999,7 +1327,153 @@ class Player(ttk.Frame):
                 self._fs_btn.withdraw()
         except tk.TclError:
             pass
+        self._place_boxwin()             # the caption box follows the video when the window moves
         self.after(120, self._hover_check)
+
+    def _video_double(self, e):
+        """Double-click on the video: edit the caption when it's on the caption (drawn on the
+        video), otherwise fullscreen."""
+        if self._on_caption(e):
+            self._edit_caption()
+        else:
+            self.toggle_fullscreen()
+
+    def _on_caption(self, e) -> bool:
+        if not (self.on_caption_edit and self._overlay_on() and self.available and self.path):
+            return False
+        if not isinstance(self._caption_shown, tuple):          # no caption showing
+            return False
+        h = max(e.widget.winfo_height(), 1)
+        y = e.y_root - e.widget.winfo_rooty()
+        band = 0.35 * h                                         # where the caption sits (near the edge)
+        return y <= band if self.cap_style.get("position") == "top" else y >= h - band
+
+    def _edit_caption(self, layer: int = 0):
+        """Double-click on a caption: the app gets the caption showing in that spot (paused, out of
+        fullscreen) and opens it for typing right there (start_caption_edit)."""
+        if not self.on_caption_edit or not self.available or not self.path:
+            return
+        if getattr(self, "_capedit", None) is not None:
+            return
+        caps = self._captions_at(max(self.mp.get_time() / 1000, 0))
+        cap = next((c for c in caps if (c[6] if len(c) > 6 else 0) == layer), caps[0] if caps else None)
+        if not cap:
+            return
+        if self.mp.is_playing():
+            self.mp.set_pause(1)
+        if self._fs is not None:
+            self.toggle_fullscreen()
+        self.after_idle(lambda: self.on_caption_edit(cap))
+
+    # ---------------------------------------------------------------- typing on a caption
+
+    def start_caption_edit(self, cap, text: str, done: Callable[[Optional[str]], None]):
+        """Type on the caption itself: a box over the video where the caption sits, with the line's
+        text in it. Enter keeps the new text (done(text)), Esc throws it away (done(None));
+        clicking elsewhere keeps it too."""
+        from transcriber.captions import contrast_text
+        self.end_caption_edit(commit=False)
+        layer = cap[6] if len(cap) > 6 and cap[6] else 0
+        spk = cap[3] if len(cap) > 3 and cap[3] else ""
+        box = self._boxwin_on() and spk
+        bg = spk if box else "#161616"
+        fg = contrast_text(spk) if box else CAPTION_COLORS.get(self.cap_style.get("color", "white"), "#ffffff")
+        win = tk.Toplevel(self)
+        win.withdraw()
+        win.overrideredirect(True)
+        try:
+            win.transient(self.winfo_toplevel())
+        except tk.TclError:
+            pass
+        t = tk.Text(win, wrap="word", borderwidth=0, highlightthickness=2, highlightbackground="#4cc2ff",
+                    highlightcolor="#4cc2ff", background=bg, foreground=fg, insertbackground=fg,
+                    padx=10, pady=4, undo=True, height=1)
+        t.pack(fill="both", expand=True)
+        t.insert("1.0", text)
+        t.tag_configure("center", justify="center")
+        t.tag_add("center", "1.0", "end")
+        self._capedit = {"win": win, "text": t, "layer": layer, "done": done, "orig": text}
+        # the caption underneath goes away while its words are typed on
+        if self._boxwin_on():
+            wins = self.__dict__.get("_capwins", {})
+            if layer in wins:
+                wins[layer][0].withdraw()
+        elif self._overlay_on():
+            self._marquee("")
+        t.bind("<Return>", lambda e: self.end_caption_edit(True) or "break")
+        t.bind("<KP_Enter>", lambda e: self.end_caption_edit(True) or "break")
+        t.bind("<Escape>", lambda e: self.end_caption_edit(False) or "break")
+        t.bind("<FocusOut>", lambda e: self.after(80, lambda: self.end_caption_edit(True)))
+        t.bind("<Tab>", lambda e: "break")
+        t.bind("<KeyRelease>", lambda e: (self._size_capedit(), t.tag_add("center", "1.0", "end")))
+        self._size_capedit()
+        win.deiconify()
+        win.lift()
+        t.focus_force()
+        t.mark_set("insert", "end-1c")
+        t.see("insert")
+
+    def _size_capedit(self):
+        """Fit the editor to its words, where the caption sits over the video."""
+        ed = getattr(self, "_capedit", None)
+        if ed is None:
+            return
+        try:
+            target = self._fs[1] if self._fs else self.screen
+            w, h = target.winfo_width(), target.winfo_height()
+            overlay = self._overlay_on()
+            if overlay:
+                px = max(int(h * caption_scale(self.cap_style)[0] * 0.8), 11)
+                font = (CAPTION_FONT, -px, "bold")
+            else:
+                size = caption_scale(self.cap_style)[1]
+                font = ui_font(size, bold=True)
+                px = int(size * 1.6)
+            t = ed["text"]
+            f = tkfont.Font(font=font)
+            width_px = int(w * 0.85)
+            chars = max(int(width_px / max(f.measure("n"), 1)), 10)
+            words = t.get("1.0", "end-1c")
+            lines, cur = 1, 0
+            for word in words.split():
+                if cur and cur + 1 + len(word) > chars:
+                    lines, cur = lines + 1, len(word)
+                else:
+                    cur += (1 if cur else 0) + len(word)
+            t.configure(font=font, width=chars, height=min(max(lines, 1), 5))
+            win = ed["win"]
+            win.update_idletasks()
+            rw, rh = win.winfo_reqwidth(), win.winfo_reqheight()
+            x = target.winfo_rootx() + (w - rw) // 2
+            if overlay:
+                margin = int(h * 0.05)
+                step = ed["layer"] * (rh + max(int(px * 0.3), 4))
+                y = target.winfo_rooty() + (margin + step if self.cap_style.get("position") == "top"
+                                            else h - rh - margin - step)
+            else:                                    # the strip below the video: over the strip
+                strip = self.caption
+                y = strip.winfo_rooty() + max((strip.winfo_height() - rh) // 2, 0)
+            win.geometry(f"+{x}+{y}")
+        except tk.TclError:
+            pass
+
+    def end_caption_edit(self, commit: bool = True):
+        """Close the caption editor; commit: hand the new text to the app (None if unchanged)."""
+        ed = getattr(self, "_capedit", None)
+        if ed is None:
+            return
+        self._capedit = None
+        try:
+            new = " ".join(ed["text"].get("1.0", "end-1c").split())
+            ed["win"].destroy()
+        except tk.TclError:
+            new = None
+        self._caption_shown = "redraw"
+        if commit and new is not None and new != " ".join(ed["orig"].split()):
+            ed["done"](new)
+        else:
+            ed["done"](None)
+        self.refresh_captions()
 
     def toggle_fullscreen(self):
         if not self.available or not self.path:
@@ -1017,7 +1491,7 @@ class Player(ttk.Frame):
             video = tk.Frame(win, background="black")
             cap = self._make_caption(win, 18)
             cap.configure(height=2)
-            size = CAPTION_SIZES.get(self.cap_style.get("size", "medium"), CAPTION_SIZES["medium"])[1]
+            size = caption_scale(self.cap_style)[1]
             cap.configure(font=ui_font(size + 6, bold=True),
                           foreground=CAPTION_COLORS.get(self.cap_style.get("color", "white"), "#ffffff"))
             if not self._overlay_on():
@@ -1028,7 +1502,8 @@ class Player(ttk.Frame):
                 w.bind("<F11>", lambda e: self.toggle_fullscreen())
                 w.bind("<space>", lambda e: self.toggle())
             video.bind("<Button-1>", lambda e: self.toggle())
-            video.bind("<Double-Button-1>", lambda e: self.toggle_fullscreen())
+            video.bind("<Double-Button-1>", self._video_double)
+            cap.bind("<Double-Button-1>", lambda e: self._edit_caption())
             win.protocol("WM_DELETE_WINDOW", self.toggle_fullscreen)
             win.update()
             if win.winfo_width() < 200:     # fullscreen not supported here: cover the screen instead
@@ -1040,7 +1515,7 @@ class Player(ttk.Frame):
         else:
             win = self._fs[0]
             self._fs = None
-            surface = self.screen
+            surface = self.surface
             win.destroy()
         self._caption_shown = "redraw"
         self._rehost(surface, pos, playing)
@@ -1062,6 +1537,8 @@ class Player(ttk.Frame):
                     self.mp.set_pause(1)
                 self.mp.audio_set_mute(muted)
                 self.after(100, lambda: self._follow_extras(force=True))
+                self._marq_color = None
+                self.refresh_captions(force=True)
             else:
                 self.after(50, lambda: resume(tries + 1))
         self.after(50, resume)
@@ -1082,8 +1559,8 @@ class Player(ttk.Frame):
                 self.mute_btn.configure(text=glyph(self, "mute" if muted else "volume"))
                 self.play_tip.set_text("Pause" if playing else "Play")
                 self.mute_tip.set_text("Unmute" if muted else "Mute")
-                self._show_caption(self._caption_at(t))
-                if self._tiles:
+                self._show_caption(self._captions_at(t))
+                if self._tiles or getattr(self, "_note_view", False):
                     self._draw_call()
                 if self.on_time:
                     self.on_time(t, playing)

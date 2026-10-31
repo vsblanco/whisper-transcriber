@@ -30,6 +30,7 @@ MODEL_NOTES = {
     "medium": "accurate (recommended)",
     "large": "most accurate, slowest",
     "turbo": "near-large accuracy, much faster",
+    "parakeet": "NVIDIA: fastest, very accurate (English + 24 languages)",
 }
 
 PENDING, WORKING, DONE, FAILED, CANCELLED = "Waiting", "Transcribing", "Done", "Failed", "Cancelled"

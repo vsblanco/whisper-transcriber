@@ -173,11 +173,30 @@ def test_session_sync_and_crosstalk(tmp_path):
              _tone_file(tmp_path, "b", b, start=7.5)]
     offs = find_offsets(paths, 0)
     assert [round(o, 1) for o, _ in offs] == [0.0, 3.2, 7.5]
-    seg_a = [Segment(x, y, "A") for x, y in A_TIMES] + [Segment(14, 18, "bleed")]
-    seg_b = [Segment(x, y, "B") for x, y in B_TIMES] + [Segment(20, 24, "bleed")]
+    words_a = ["alpha one is talking", "alpha two keeps going", "alpha three says more"]
+    words_b = ["bravo one answers back", "bravo two has a story", "bravo three wraps up"]
+    seg_a = [Segment(x, y, w) for (x, y), w in zip(A_TIMES, words_a)] + [Segment(14, 18, "bravo two has story")]
+    seg_b = [Segment(x, y, w) for (x, y), w in zip(B_TIMES, words_b)] + [Segment(20, 24, "alpha three says more")]
+    seg_b.append(Segment(11, 13, "something only this mic heard"))     # quieter, but no one else has it
     kept = drop_crosstalk([(seg_a, offs[1][0], envelope(paths[1])), (seg_b, offs[2][0], envelope(paths[2]))])
-    assert [s.text for s in kept[0]] == ["A", "A", "A"]
-    assert [s.text for s in kept[1]] == ["B", "B", "B"]
+    assert [s.text for s in kept[0]] == words_a                          # B's story caught by A's mic: gone
+    assert [s.text for s in kept[1]] == words_b + ["something only this mic heard"]
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_crosstalk_fair_between_quiet_and_loud_mics(tmp_path):
+    """One mic set much louder than the other: its catch of the quiet person can be louder than the
+    quiet person's own mic, but compared with each mic's own usual level the right one wins."""
+    from transcriber.session import drop_crosstalk, envelope
+    a = [(t, 220, 0.08) for t in A_TIMES] + [(t, 330, 0.01) for t in B_TIMES]       # a quiet mic
+    b = [(t, 330, 0.9) for t in B_TIMES] + [(t, 220, 0.12) for t in A_TIMES]        # a hot mic
+    pa, pb = _tone_file(tmp_path, "qa", a), _tone_file(tmp_path, "hb", b)
+    said = "we should get food after this"
+    seg_a = [Segment(2, 5, said)]                           # A said it (their own, quiet mic)
+    seg_b = [Segment(2, 5, said), Segment(6, 9.5, "bravo talking now")]   # B's hot mic caught it louder
+    kept = drop_crosstalk([(seg_a, 0.0, envelope(pa)), (seg_b, 0.0, envelope(pb))])
+    assert [s.text for s in kept[0]] == [said]
+    assert [s.text for s in kept[1]] == ["bravo talking now"]
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
@@ -392,7 +411,8 @@ def test_addon_worker_protocol(tmp_path, monkeypatch):
     worker = fake / "diarize_worker.py"
     worker.write_text('import json, os, sys\nprint("LOG: hello " + os.environ["HF_TOKEN"])\n'
                       'print("RESULT: " + json.dumps({"turns": [[0, 1.5, "SPEAKER_00"]], "prints": {"SPEAKER_00": [0.1]}}))\n')
-    monkeypatch.setattr(addons, "_worker_source", lambda: worker)
+    monkeypatch.setattr(addons, "_worker_source",
+                        lambda name="diarize_worker.py": worker if name == "diarize_worker.py" else tmp_path / "none.py")
     logs = []
     turns, prints = addons.run_diarize("x.wav", "tok", logs.append)
     assert turns == [(0, 1.5, "SPEAKER_00")] and prints == {"SPEAKER_00": [0.1]} and logs == ["hello tok"]
@@ -425,3 +445,43 @@ def test_update_check(monkeypatch):
     monkeypatch.setattr(addons, "_get_json", lambda url: {"tag_name": "v0.1.0", "assets": []})
     assert updater.check() is None                         # older than this copy: nothing to do
     assert updater.install_kind() in ("git", "source")
+
+
+def test_timeline_start_and_end(tmp_path):
+    from transcriber.speakers import read_speakers_file
+    f = make(tmp_path)
+    # line 1 moved as a whole (same length), line 2 trimmed at both ends
+    apply_text_edits(f, {}, times={1: (2.5, 4.0), 2: (4.2, 4.8)})
+    segs = read_speakers_file(f["speakers"])["segments"]
+    assert [(s["start"], s["end"]) for s in segs[1:]] == [(2.5, 4.0), (4.2, 4.8)]
+    words = read_words(f["words"])
+    assert words[1][0][0] == pytest.approx(2.5) and words[1][-1][1] == pytest.approx(4.0)   # shifted
+    assert words[2][0][0] == pytest.approx(4.2) and words[2][-1][1] == pytest.approx(4.8)   # kept inside
+    assert words[2][1][0] == pytest.approx(4.5)                                             # untouched word
+
+
+def test_clip_with_a_subtitle_track(tmp_path):
+    """A clip exported with "Subtitle track": the captions ride inside the mp4 as a track players
+    list under Subtitles, on by default; the times count from the clip's start."""
+    import shutil
+    import subprocess
+    from transcriber.review_ui import ReviewMixin
+    cmd = ReviewMixin.clip_command("v.mp4", 10, 16, "o.mp4", True, None, None, "", "clip.srt", "english")
+    s = " ".join(cmd)
+    assert s.index("-i clip.srt") < s.index("-map 0:v:0") and "-map 1:0 -c:s mov_text" in s
+    assert "language=eng" in s and "-disposition:s:0 default" in s
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        return
+    src = tmp_path / "v.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10:duration=20",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=20", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-shortest", str(src)], check=True)
+    (tmp_path / "clip.srt").write_text("1\n00:00:01,000 --> 00:00:03,000\nHello there.\n", encoding="utf-8")
+    out = tmp_path / "o.mp4"
+    cmd = ReviewMixin.clip_command(str(src), 10, 16, str(out), True, None, None, "", "clip.srt", "english")
+    r = subprocess.run(cmd, cwd=tmp_path, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-400:]
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name:stream_tags=language:stream_disposition=default",
+                            "-of", "csv=p=0", str(out)], capture_output=True, text=True).stdout
+    assert "subtitle,mov_text" in probe.replace("mov_text,subtitle", "subtitle,mov_text") or "mov_text" in probe
+    assert "eng" in probe

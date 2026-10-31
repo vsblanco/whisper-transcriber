@@ -1,7 +1,11 @@
-"""Ctrl+F: a floating find box in the top right of the transcript.
+"""Ctrl+F: a floating find box in the top right of the transcript (or of the Library).
 
-Matches light up as you type and the rest of the text dims a little. The box shows "3 of 12",
-with up/down arrows (or Enter / Shift+Enter) to step through. Esc closes it.
+In the transcript, matches light up as you type and the rest of the text dims a little. The box
+shows "3 of 12", with up/down arrows (or Enter / Shift+Enter) to step through. Esc closes it.
+
+On the Library tab the same box searches every transcript: the list narrows to the ones that say it,
+the arrows move through them, and Enter shows every matching line (in the Transcript tab). Opening a
+transcript from the narrowed list keeps the search going in it. Esc clears it.
 Used as a mixin by the App (needs self.text and self._palette()).
 """
 
@@ -29,6 +33,8 @@ class FindMixin:
         self._find_box = None
         self._find_matches: list[tuple[str, str]] = []
         self._find_i = -1
+        self._find_scope = "transcript"            # or "library"
+        self._find_queries = {"transcript": "", "library": ""}
         for k in ("f", "F"):
             bind_keys(self, k, lambda e: self._find_open())
         for k in ("h", "H"):
@@ -55,20 +61,46 @@ class FindMixin:
     # ------------------------------------------------------------ the box
 
     def _find_open(self, replace: bool = False):
-        if getattr(self, "_editing", None) is not None:
-            self._end_edit()
+        scope = "library" if getattr(self, "_tab_name", lambda: "")() == "library" and not replace else "transcript"
+        if scope == "transcript":
+            if hasattr(self, "_show_tab"):
+                self._show_tab("transcript")
+            if getattr(self, "_editing", None) is not None:
+                self._end_edit()
         if self._find_box is None:
             self._find_build()
+        self._find_set_scope(scope)
         if replace and not self._find_replacing:
             self._find_toggle_replace()
         box = self._find_box
         m = self._find_margin
-        box.place(in_=self.text, relx=1.0, x=-14 + m, y=10 - m, anchor="ne")
+        if scope == "transcript":
+            box.place(in_=self.text, relx=1.0, x=-14 + m, y=10 - m, anchor="ne")
+        else:                                       # on the tab row, right of the tabs
+            box.place(in_=self.tabs, relx=1.0, x=-2 + m, y=-m, anchor="ne")
         tk.Misc.lift(box)          # (a Canvas has its own lift for drawn items)
         self._find_entry.focus_set()
         self._find_entry.select_range(0, "end")
         self._find_run(keep_position=True)
         return "break"
+
+    def _find_set_scope(self, scope: str):
+        """Searching the transcript or the Library: each keeps its own text."""
+        if self._find_box is None:
+            return
+        if scope != self._find_scope:
+            self._find_queries[self._find_scope] = self._find_var.get()
+            self._find_scope = scope
+            self._find_var.set(self._find_queries[scope])
+        library = scope == "library"
+        if library and self._find_replacing:
+            self._find_toggle_replace()
+        self._find_hint.configure(text="Search all transcripts" if library else "Find in transcript")
+        if library:
+            self._find_chev.pack_forget()
+        elif not self._find_chev.winfo_ismapped():
+            self._find_chev.pack(side="left", fill="y", padx=(0, 4), before=self._find_entry)
+        self._find_style_box()
 
     def _find_build(self):
         """A rounded box with a soft shadow (drawn as an image), with the controls on top:
@@ -81,7 +113,9 @@ class FindMixin:
         self._find_h = self._find_row_h
         self._find_replacing = False
         self._find_margin = m = int(12 * sc)
-        box = tk.Canvas(self.text.master, width=self._find_w + 2 * m, height=self._find_h + 2 * m,
+        # (in the tab row's frame, so it can float over the transcript or over the Library list)
+        holder = getattr(self, "tabs", None) or self.text.master
+        box = tk.Canvas(holder, width=self._find_w + 2 * m, height=self._find_h + 2 * m,
                         highlightthickness=0, borderwidth=0)
         self._find_box = box
         self._find_bg_item = box.create_image(0, 0, anchor="nw")
@@ -153,7 +187,8 @@ class FindMixin:
             e.bind("<Escape>", lambda ev: self._find_close() or "break")
             e.bind("<Down>", lambda ev: self._find_step(1) or "break")
             e.bind("<Up>", lambda ev: self._find_step(-1) or "break")
-        entry.bind("<Return>", lambda e: self._find_step(1) or "break")
+        entry.bind("<Return>", lambda e: (self._find_library_results() if self._find_scope == "library"
+                                          else self._find_step(1)) or "break")
         entry.bind("<Shift-Return>", lambda e: self._find_step(-1) or "break")
         rep.bind("<Return>", lambda e: self._find_replace_one() or "break")
         rep.bind("<Control-Return>", lambda e: self._find_replace_all() or "break")
@@ -254,10 +289,20 @@ class FindMixin:
         border = "#3d3d3d" if dark else "#dadada"
         icon_fg = "#c8c8c8" if dark else "#5a5a5a"
 
-        # Background: the transcript's color, a blurred shadow, then the rounded box with a thin edge.
+        # Background: the color under it, a blurred shadow, then the rounded box with a thin edge.
         w, h, m = self._find_w, self._find_h, self._find_margin
         W, H, k = w + 2 * m, h + 2 * m, 2                     # drawn at 2x, then scaled down (smooth corners)
         under = p["bg"]
+        if self._find_scope == "library":
+            from tkinter import ttk
+            under = str(ttk.Style(self).lookup("TNotebook", "background") or "") or \
+                str(ttk.Style(self).lookup("TFrame", "background") or "") or p["bg"]
+            if not under.startswith("#"):
+                try:
+                    r, g, b = (v // 256 for v in self.winfo_rgb(under))
+                    under = f"#{r:02x}{g:02x}{b:02x}"
+                except Exception:
+                    under = p["bg"]
         img = Image.new("RGBA", (W * k, H * k), under)
         shadow = Image.new("RGBA", (W * k, H * k), (0, 0, 0, 0))
         ImageDraw.Draw(shadow).rounded_rectangle(
@@ -304,6 +349,14 @@ class FindMixin:
                         cursor="hand2" if self._find_matches else "arrow")
 
     def _find_close(self):
+        if self._find_scope == "library":           # Esc in the Library: the whole list again
+            if self._find_box is not None:
+                self._find_box.place_forget()
+                self._find_var.set("")
+            self._find_queries["library"] = ""
+            self.search_var.set("")
+            self.saved.focus_set()
+            return
         if self._find_box is not None:
             self._find_box.place_forget()
         for tag in ("find_dim", "find", "find_cur"):
@@ -317,6 +370,13 @@ class FindMixin:
     # ------------------------------------------------------------ searching
 
     def _find_run(self, keep_position: bool = False):
+        if self._find_scope == "library":
+            query = self._find_var.get() if self._find_box is not None else ""
+            self._find_queries["library"] = query
+            if self.search_var.get() != query:
+                self.search_var.set(query)              # (the list narrows a moment later)
+            self._find_update_buttons()
+            return
         t = self.text
         for tag in ("find_dim", "find", "find_cur"):
             t.tag_remove(tag, "1.0", "end")
@@ -352,10 +412,58 @@ class FindMixin:
         self._find_show()
 
     def _find_step(self, d: int):
+        if self._find_scope == "library":           # move through the narrowed list
+            kids = self.saved.get_children()
+            if not kids:
+                return
+            sel = self.saved.selection()
+            i = kids.index(sel[0]) + d if sel and sel[0] in kids else (0 if d > 0 else len(kids) - 1)
+            iid = kids[max(0, min(i, len(kids) - 1))]
+            self.saved.selection_set(iid)
+            self.saved.see(iid)
+            return
         if not self._find_matches:
             return
         self._find_i = (self._find_i + d) % len(self._find_matches)
         self._find_show()
+
+    def _find_library_results(self):
+        """Enter in the Library search: every matching line, in the Transcript tab."""
+        query = self._find_var.get().strip()
+        if not query:
+            return
+        self._list_mode = "library"
+        self._show_tab("transcript")
+
+        def show():                    # (after the list's own selection has settled)
+            shown = [self.saved_items[i] for i in self.saved.get_children() if i in self.saved_items]
+            self._show_search_results(query.lower(), shown)
+            self._find_after_render()
+        self.after(80, show)
+
+    def _find_library_count(self):
+        """'3 found' while the Library search narrows the list."""
+        if self._find_box is None or self._find_scope != "library":
+            return
+        n = len(self.saved.get_children()) if self._find_var.get().strip() else 0
+        self._find_count.configure(text=f"{n} found" if self._find_var.get().strip() else "")
+
+    def _find_tab_changed(self, name: str):
+        """Keep the box with its tab: the Library search shows on Library; opening a transcript from
+        a narrowed Library keeps looking for the same words in it."""
+        if self._find_box is None:
+            return
+        lib = self._find_queries["library"] if self._find_scope != "library" else self._find_var.get()
+        if name == "library" and lib.strip():
+            self._find_open()
+        elif name == "transcript" and self._find_scope == "library" and lib.strip():
+            self._find_queries["transcript"] = lib
+            self.after_idle(self._find_open)
+        elif self._find_box.winfo_ismapped() and (name == "queue" or (name == "library") != (self._find_scope == "library")):
+            if self._find_scope == "transcript":
+                self._find_close()
+            else:
+                self._find_box.place_forget()
 
     def _find_show(self):
         t = self.text

@@ -52,6 +52,18 @@ def usable_token(token: str) -> Optional[str]:
     return "" if model_downloaded() else None
 
 
+# Which model finds "who spoke when" (Settings > Speakers). Voiceprints always come from pyannote's
+# voice model, so People are recognized the same way with either.
+SPEAKER_MODELS = {"pyannote": "pyannote (any number of people)",
+                  "nemotron": "NVIDIA Nemotron 3 (up to 8 people, best with an NVIDIA card)"}
+speaker_model = "pyannote"
+
+
+def set_speaker_model(name: str) -> None:
+    global speaker_model
+    speaker_model = name if name in SPEAKER_MODELS else "pyannote"
+
+
 def _in_process() -> bool:
     """pyannote is installed in this Python (the Python version of the app)."""
     import importlib.util
@@ -59,10 +71,17 @@ def _in_process() -> bool:
     return not getattr(sys, "frozen", False) and importlib.util.find_spec("pyannote") is not None
 
 
-def diarize(wav_path: str, token: str, log: Callable[[str], None] = print) -> tuple[list, dict]:
+def diarize(wav_path: str, token: str, log: Callable[[str], None] = print,
+            model: Optional[str] = None) -> tuple[list, dict]:
     """Find who spoke when. Returns (turns, voiceprints):
     turns = [(start, end, "SPEAKER_00"), ...], voiceprints = {"SPEAKER_00": [floats], ...}.
-    Runs here when pyannote is installed, otherwise in the speaker detection add-on's own Python."""
+    Runs here when pyannote is installed, otherwise in the speaker detection add-on's own Python.
+    model: "pyannote" or "nemotron" (default: the one picked in Settings)."""
+    if (model or speaker_model) == "nemotron":
+        try:
+            return _diarize_nemotron(wav_path, token, log)
+        except Exception as exc:
+            log(f"NVIDIA Nemotron didn't work ({exc}); using pyannote instead.")
     if _in_process():
         from transcriber.diarize_worker import run
         return run(wav_path, token, log)
@@ -70,6 +89,18 @@ def diarize(wav_path: str, token: str, log: Callable[[str], None] = print) -> tu
     if addons.speakers_installed():
         return addons.run_diarize(wav_path, token, log)
     raise RuntimeError(detection_status()[1])
+
+
+def _diarize_nemotron(wav_path: str, token: str, log) -> tuple[list, dict]:
+    from transcriber import core
+    if core.nvidia_in_process():
+        from transcriber import nvidia_worker
+        return nvidia_worker.diarize(wav_path, token, log)
+    from transcriber import addons
+    if addons.speakers_installed():
+        return addons.run_nvidia("diarize", wav_path, token, log)
+    from transcriber import nvidia_worker
+    raise RuntimeError(nvidia_worker.missing() or "the NVIDIA models aren't installed")
 
 
 def assign(segments, turns) -> list[Optional[str]]:
@@ -152,11 +183,13 @@ def has_speakers(files: dict) -> bool:
     return bool(data) and any(s.get("speaker") for s in data.get("segments", []))
 
 
-def rows_for(files: dict, people) -> list[tuple]:
+def rows_for(files: dict, people, data: Optional[dict] = None) -> list[tuple]:
     """A saved version's lines as (start seconds, speaker label, name, text, person id) for showing.
-    Uses the speakers file when there is one, else the plain transcript."""
+    Uses the speakers file when there is one (data: its contents, if already read), else the plain
+    transcript."""
     sp = files.get("speakers")
-    data = read_speakers_file(sp) if sp else None
+    if data is None:
+        data = read_speakers_file(sp) if sp else None
     if data and data.get("segments"):
         names = display_names(data, people)
         pids = {lab: (info or {}).get("person") for lab, info in data.get("speakers", {}).items()}

@@ -87,7 +87,7 @@ class QueueMixin:
         return next((j for j in self.jobs if j["status"] == WORKING), None)
 
     def _on_queue_select(self, _event=None):
-        if self.tabs.index("current") != 0:
+        if self._list_mode != "queue":
             return
         sel = self.tree.selection()
         job = self._job(sel[0]) if sel else None
@@ -119,8 +119,8 @@ class QueueMixin:
             added += 1
         if added:
             self.status_var.set(f"{self._count(PENDING)} file(s) ready.")
-            if self.tabs.index("current") != 0:
-                self.tabs.select(0)
+            self._update_queue_tab()
+            self._show_tab("queue")
 
     def _add_files_dialog(self):
         exts = " ".join(f"*{e}" for e in sorted(MEDIA_EXTENSIONS))
@@ -138,8 +138,7 @@ class QueueMixin:
         widget.dnd_bind("<<Drop>>", self._on_drop)
 
     def _drag_enter(self, event):
-        if self.tabs.index("current") != 0:
-            self.tabs.select(0)
+        self._show_tab("queue")
         self._show_drop_zone()
         return event.action
 
@@ -201,6 +200,7 @@ class QueueMixin:
                 self.jobs.remove(job)
                 self.tree.delete(iid)
                 self.thumb_images.pop(iid, None)
+        self._update_queue_tab()
         self._on_queue_select()
 
     def _clear_finished(self):
@@ -208,6 +208,7 @@ class QueueMixin:
             self.jobs.remove(job)
             self.tree.delete(job["iid"])
             self.thumb_images.pop(job["iid"], None)
+        self._update_queue_tab()
         self._on_queue_select()
 
     def _job(self, iid):
@@ -222,10 +223,11 @@ class QueueMixin:
         vals[0] = status
         self.tree.item(job["iid"], values=vals)
         if self.display == ("job", job["iid"]):
-            self.right.configure(text=self._job_title(job))
+            self._set_title(self._job_title(job))
+        self._update_queue_tab()
 
     def _start(self):
-        if self.tabs.index("current") == 1 and self._selected_saved():
+        if self._list_mode == "library" and self._selected_saved():
             self._transcribe_again(self._selected_saved())
             return
         pending = [j for j in self.jobs if j["status"] == PENDING]
@@ -272,7 +274,8 @@ class QueueMixin:
 
         self.cancel_flag.clear()
         self.follow_live = True
-        self.tabs.select(0)
+        self._list_mode = "queue"              # the transcript follows the queue: watch it as it's written
+        self._show_tab("transcript")
         self.start_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
         self.progress.configure(value=0)
@@ -338,7 +341,7 @@ class QueueMixin:
             job["tracks"], job["choices"] = src_tracks, choices
             self._update_job_label(job)
             self.tree.selection_set(job["iid"])
-        self.tabs.select(0)
+        self._list_mode = "queue"
         self._start()
 
     def _cancel(self):

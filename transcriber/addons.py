@@ -69,9 +69,69 @@ def download_size_note(gpu: Optional[bool] = None) -> str:
             "about 400 MB to download, about 1.2 GB on disk")
 
 
-def _worker_source() -> Path:
+def _worker_source(name: str = "diarize_worker.py") -> Path:
     base = Path(getattr(sys, "_MEIPASS", "")) / "transcriber" if getattr(sys, "frozen", False) else Path(__file__).parent
-    return base / "diarize_worker.py"
+    return base / name
+
+
+def _sync_workers() -> None:
+    """Keep the add-on's copies of the workers current with the app."""
+    for name in ("diarize_worker.py", "nvidia_worker.py"):
+        src, dst = _worker_source(name), ADDON_DIR / name
+        try:
+            if src.exists() and (not dst.exists() or src.read_bytes() != dst.read_bytes()):
+                shutil.copy2(src, dst)
+        except OSError:
+            pass
+
+
+def nvidia_ready() -> bool:
+    """The add-on's Python has a Transformers new enough for the NVIDIA models."""
+    return speakers_installed() and any((ADDON_DIR).glob("**/site-packages/transformers/models/nemotron3_diarization"))
+
+
+def install_nvidia(log: Callable[[str], None], cancel: Callable[[], bool] = lambda: False) -> None:
+    """Add Transformers (for NVIDIA Parakeet and Nemotron) to the speaker detection add-on."""
+    if not speakers_installed():
+        raise RuntimeError("Install speaker detection first: the NVIDIA models use its Python.")
+    _run_logged([str(addon_python()), "-m", "pip", "install", "--no-input", "--progress-bar", "off", "--upgrade",
+                 "transformers>=5.21"], log, cancel)
+    _sync_workers()
+
+
+def run_nvidia(kind: str, wav_path: str, token: str, log: Callable[[str], None], on_line=None,
+               should_cancel: Callable[[], bool] = lambda: False):
+    """NVIDIA Parakeet ("transcribe": lines) or Nemotron ("diarize": (turns, voiceprints)) in the
+    add-on's Python. Same results as nvidia_worker.transcribe() / diarize()."""
+    if not nvidia_ready():
+        raise RuntimeError("The NVIDIA models aren't installed. Settings > What's installed > NVIDIA models.")
+    _sync_workers()
+    env = dict(os.environ, HF_TOKEN=token or "", PYTHONUNBUFFERED="1")
+    p = subprocess.Popen([str(addon_python()), str(ADDON_DIR / "nvidia_worker.py"), kind, wav_path],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=_NO_WINDOW, env=env)
+    result, error = None, None
+    for line in p.stdout:
+        if should_cancel():
+            p.kill()
+            from transcriber.core import TranscriptionCancelled
+            raise TranscriptionCancelled()
+        line = line.rstrip()
+        if line.startswith("LOG: "):
+            log(line[5:])
+        elif line.startswith("SEGMENT: ") and on_line:
+            on_line(json.loads(line[9:]))
+        elif line.startswith("RESULT: "):
+            result = json.loads(line[8:])
+        elif line.startswith("ERROR: "):
+            error = line[7:]
+    err_text = p.stderr.read()
+    p.wait()
+    if result is None:
+        tail = [x for x in err_text.strip().splitlines() if x.strip()][-1:]
+        raise RuntimeError(error or (tail[0] if tail else "The NVIDIA model stopped unexpectedly."))
+    if kind == "transcribe":
+        return result["lines"]
+    return [tuple(t) for t in result["turns"]], result["prints"]
 
 
 def _ssl_context():
@@ -179,6 +239,7 @@ def install_speakers(log: Callable[[str], None], progress: Callable[[float, str]
         _run_logged(pip + ["pyannote.audio"], log, cancel)
         progress(0.95, "Finishing...")
         shutil.copy2(_worker_source(), new_dir / "diarize_worker.py")
+        shutil.copy2(_worker_source("nvidia_worker.py"), new_dir / "nvidia_worker.py")
         (new_dir / "installed.json").write_text(json.dumps(
             {"installed": time.strftime("%Y-%m-%d %H:%M"), "gpu": gpu, "python": name}), encoding="utf-8")
         shutil.rmtree(ADDON_DIR, ignore_errors=True)
@@ -196,12 +257,7 @@ def remove_speakers() -> None:
 def run_diarize(wav_path: str, token: str, log: Callable[[str], None]) -> tuple[list, dict]:
     """Speaker detection in the add-on's Python. Same result as diarize_worker.run()."""
     worker = ADDON_DIR / "diarize_worker.py"
-    try:                                   # keep the add-on's copy current with the app
-        src = _worker_source()
-        if src.exists() and src.read_bytes() != worker.read_bytes():
-            shutil.copy2(src, worker)
-    except OSError:
-        pass
+    _sync_workers()                        # keep the add-on's copies current with the app
     env = dict(os.environ, HF_TOKEN=token or "", PYTHONUNBUFFERED="1")
     p = subprocess.Popen([str(addon_python()), str(worker), wav_path], stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True, creationflags=_NO_WINDOW, env=env)
@@ -223,6 +279,53 @@ def run_diarize(wav_path: str, token: str, log: Callable[[str], None]) -> tuple[
 
 
 # ---------------------------------------------------------------- pip, for the Python version
+
+def torch_build() -> str:
+    """The installed PyTorch's build, without importing it: "cpu", "cu126"..., or "" if none."""
+    from importlib import metadata
+    try:
+        version = metadata.version("torch")
+    except metadata.PackageNotFoundError:
+        return ""
+    return version.split("+", 1)[1] if "+" in version else ("cpu" if sys.platform == "win32" else "default")
+
+
+def nvidia_install_plan() -> dict:
+    """What the NVIDIA models still need in this Python: {"torch_gpu": bool, "transformers": bool}."""
+    import importlib.util
+    try:
+        new_enough = importlib.util.find_spec("transformers.models.nemotron3_diarization") is not None
+    except (ImportError, ValueError):
+        new_enough = False
+    build = torch_build()
+    return {"torch_gpu": nvidia_gpu() and build in ("", "cpu"), "transformers": not new_enough}
+
+
+def install_after_close(plan: dict) -> None:
+    """Windows, Python version: PyTorch is in use while the app runs (its files are locked), so a
+    small window installs after the app closes, then opens the app again. Call, then quit the app."""
+    py, pyw = app_python(), sys.executable
+    script = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
+    relaunch = f'start "" "{pyw}" "{script}"' if script else f'start "" "{pyw}" -m transcriber'
+    steps = []
+    if plan.get("torch_gpu"):
+        steps.append(f'"{py}" -m pip install --upgrade --force-reinstall --no-deps --progress-bar on torch '
+                     f'--index-url {TORCH_GPU_INDEX}')
+    steps.append(f'"{py}" -m pip install --upgrade --progress-bar on "transformers>=5.21"')
+    lines = ["@echo off", "chcp 65001 >nul", "title Whisper Transcriber: installing the NVIDIA models",
+             "echo Installing the NVIDIA models' parts" + (" (the GPU version of PyTorch is about 3 GB)" if
+                                                          plan.get("torch_gpu") else "") + ".",
+             "echo The app opens again by itself when it's done.", "echo.",
+             ":wait", f'tasklist /FI "PID eq {os.getpid()}" 2>nul | find "{os.getpid()}" >nul',
+             "if not errorlevel 1 (timeout /t 1 /nobreak >nul & goto wait)"]
+    for st in steps:
+        lines += [st, "if errorlevel 1 goto failed"]
+    lines += ["echo.", "echo Done.", relaunch, "exit /b 0", ":failed", "echo.",
+              "echo Something went wrong (see above). The app opens again; try again from What's installed.",
+              "pause", relaunch]
+    bat = Path(tempfile.gettempdir()) / "whisper_transcriber_nvidia_install.bat"
+    bat.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8", newline="")
+    os.startfile(str(bat))      # its own console window, so the progress shows
 
 def app_python() -> str:
     """The Python the app runs on (python.exe, not the windowless pythonw.exe)."""

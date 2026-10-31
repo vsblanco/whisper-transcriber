@@ -8,4 +8,5 @@ tkinterdnd2>=0.4.2
 python-vlc>=3.0
 numpy
 soundcard            # recording voice samples
+proc-tap; sys_platform == "win32"   # recording one app's sound (Record > One app)
 certifi              # secure downloads (the speaker detection add-on)

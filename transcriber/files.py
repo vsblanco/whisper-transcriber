@@ -238,26 +238,27 @@ def render_txt(t: Transcript) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _cues(t: Transcript) -> list:
+    """The transcript as captions: caption-sized pieces timed by the words (see captions.py), or
+    one caption per line when that's turned off in Settings > Captions."""
+    from transcriber import captions as C
+    lines = [C.Line(s.start, s.end, s.text, t.name_at(i), list(s.words) or None, fixed=s.fixed, layer=s.layer)
+             for i, s in enumerate(t.segments)]
+    if not C.OPTIONS.get("split", True):
+        many = len({ln.name for ln in lines if ln.name}) > 1
+        return [C.Cue(ln.start, ln.end, [(f"{ln.name}: " if ln.name and many else "") + ln.text], ln.name)
+                for ln in lines]
+    return C.build(lines, sounds=True)
+
+
 def render_srt(t: Transcript) -> str:
-    blocks = []
-    for i, s in enumerate(t.segments, 1):
-        who = t.name_at(i - 1)
-        blocks.append(
-            f"{i}\n{format_timestamp(s.start, True)} --> {format_timestamp(s.end, True)}\n"
-            + (f"{who}: " if who else "") + f"{s.text}\n"
-        )
-    return "\n".join(blocks)
+    from transcriber.captions import to_srt
+    return to_srt(_cues(t))
 
 
 def render_vtt(t: Transcript) -> str:
-    blocks = ["WEBVTT\n"]
-    for i, s in enumerate(t.segments):
-        who = t.name_at(i)
-        blocks.append(
-            f"{format_timestamp(s.start, True, '.')} --> {format_timestamp(s.end, True, '.')}\n"
-            + (f"<v {who}>" if who else "") + f"{s.text}\n"
-        )
-    return "\n".join(blocks)
+    from transcriber.captions import to_vtt
+    return to_vtt(_cues(t))
 
 
 WRITERS = {
@@ -311,7 +312,8 @@ def read_version(files: dict):
         from transcriber.speakers import read_speakers_file
         data = read_speakers_file(files["speakers"])
     if data and data.get("segments"):
-        segs = [Segment(float(x["start"]), float(x["end"]), x.get("text", "")) for x in data["segments"]]
+        segs = [Segment(float(x["start"]), float(x["end"]), x.get("text", ""), fixed=bool(x.get("fixed")),
+                        layer=x.get("layer")) for x in data["segments"]]
         labels = [x.get("speaker") for x in data["segments"]]
     else:
         segs, labels, data = read_segments(files), [], None

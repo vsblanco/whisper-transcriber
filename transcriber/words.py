@@ -159,9 +159,11 @@ def retime_lines(rows: list, pool: list) -> list:
     return out
 
 
-def _update_words(files: dict, edits: dict, deletes: set, times: dict, order_key) -> None:
+def _update_words(files: dict, edits: dict, deletes: set, times: dict, order_key, olds=None) -> None:
     """Keep the word timings lined up after edits: edited lines keep the times of their remaining
-    words, moved lines shift, deleted lines go, and everything is put in the same order."""
+    words, moved lines shift, deleted lines go, and everything is put in the same order. A line
+    given a new start and end: moved as a whole, its words shift; resized, its words stay where
+    they are but inside the new start and end."""
     wp = files.get("words")
     lines = read_words(wp) if wp else None
     if lines is None:
@@ -173,8 +175,20 @@ def _update_words(files: dict, edits: dict, deletes: set, times: dict, order_key
         if i in edits:                  # keep the times of the words that are still there
             ws = align_words(edits[i], ws, ws[0][0], ws[-1][1]) if ws else []
         if i in times and ws:
-            d = times[i] - ws[0][0]
-            ws = [[a + d, b + d, w] for a, b, w in ws]
+            t = times[i]
+            old = (olds or {}).get(i)
+            if isinstance(t, tuple) and old and abs((t[1] - t[0]) - (old[1] - old[0])) > 0.02:
+                lo, hi = t
+                out, last = [], lo
+                for a, b, w in ws:
+                    a2 = min(max(a, last, lo), hi)
+                    out.append([a2, min(max(b, a2 + 0.02), hi), w])
+                    last = a2
+                ws = out
+            else:
+                d = (t[0] - old[0] if isinstance(t, tuple) and old else
+                     (t[0] if isinstance(t, tuple) else t) - ws[0][0])
+                ws = [[a + d, b + d, w] for a, b, w in ws]
         rows.append((order_key(i), ws))
     rows.sort(key=lambda r: r[0])
     write_words(wp, [ws for _, ws in rows])

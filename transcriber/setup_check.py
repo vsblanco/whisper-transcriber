@@ -82,10 +82,32 @@ def components(vlc_ok=None) -> list:
                         ok=ready, status="Installed" if ready else "Missing", fix=f"{PIP} install pyannote.audio",
                         install=None if ready else ("pip", ["pyannote.audio"], [])))
 
+    out.append(_nvidia_component())
+
+    from transcriber import speech
+    ok = speech.available()
+    out.append(dict(key="speech", name="Extract speech (Demucs)", purpose="Settings > Transcription > Extract speech "
+                    "first: the voice pulled out of game sound, music and noise before transcribing.",
+                    ok=ok, status="Installed" if ok else "Missing", fix=f"{PIP} install demucs",
+                    install=None if ok or FROZEN else ("pip", ["demucs"], [])))
+
     ok = _has("soundcard")
     out.append(dict(key="soundcard", name="Voice sample recording", purpose="Recording people in People > mic button.",
                     ok=ok, status="Installed" if ok else "Missing", fix=f"{PIP} install soundcard",
                     install=None if ok or FROZEN else ("pip", ["soundcard"], [])))
+
+    if WINDOWS:
+        from transcriber import app_audio
+        ok = _has("proctap")
+        try:
+            old = sys.getwindowsversion().build < app_audio.MIN_BUILD
+        except Exception:
+            old = False
+        out.append(dict(key="appaudio", name="Recording one app", purpose="Record just one app's sound "
+                        "(Queue > Record > One app), like a browser or Discord.", ok=ok and not old,
+                        status="Installed" if ok and not old else
+                        ("Needs Windows 10 version 2004 or newer" if old else "Missing"),
+                        fix=f"{PIP} install proc-tap", install=None if ok or old or FROZEN else ("pip", ["proc-tap"], [])))
 
     gpu, msg = _gpu_state()
     if WINDOWS:
@@ -117,6 +139,40 @@ def components(vlc_ok=None) -> list:
                     status="Installed" if ok else "Missing", fix=f"{PIP} install pillow",
                     install=None if ok or FROZEN else ("pip", ["pillow"], [])))
     return out
+
+
+def _nvidia_component() -> dict:
+    """NVIDIA Parakeet and Nemotron: Transformers 5.21+, and PyTorch's GPU version when there's a card."""
+    from transcriber import addons
+    base = dict(key="nvidia", name="NVIDIA models",
+                purpose="Parakeet (fast, accurate speech to text) and Nemotron (who's speaking). Optional.")
+    if FROZEN:
+        ok = addons.nvidia_ready()
+        ready = addons.speakers_installed()
+        return dict(base, ok=ok, status="Installed" if ok else ("Not installed" if ready else
+                                                                 "Install speaker detection first"),
+                    fix="Click Install (adds Transformers to the speaker detection add-on)." if ready else
+                    "The NVIDIA models use the speaker detection add-on: install that first.",
+                    install=None if ok or not ready else ("addon_nvidia", None, None))
+    plan = addons.nvidia_install_plan()
+    has_torch = _has("torch")
+    build = addons.torch_build()
+    ok = has_torch and not plan["torch_gpu"] and not plan["transformers"]
+    if ok:
+        status = "Installed" + (" (on your NVIDIA GPU)" if build not in ("cpu", "default", "") else " (CPU)")
+    else:
+        bits = []
+        if plan["torch_gpu"]:
+            bits.append("PyTorch is the CPU version" if has_torch else "PyTorch isn't installed")
+        elif not has_torch:
+            bits.append("PyTorch isn't installed")
+        if plan["transformers"]:
+            bits.append("Transformers needs version 5.21 or newer")
+        status = "; ".join(bits)
+    fix = ("Click Install: " + ("the app closes, a window installs the GPU version of PyTorch (about 3 GB) and "
+                               "Transformers, then the app opens again." if plan["torch_gpu"] and WINDOWS else
+                               "installs Transformers" + (" and PyTorch." if not has_torch else ".")))
+    return dict(base, ok=ok, status=status, fix=fix, install=None if ok else ("nvidia", None, None))
 
 
 def missing_summary() -> list:

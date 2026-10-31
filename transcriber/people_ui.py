@@ -10,10 +10,9 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, ttk
 
-import tempfile
 
 from transcriber.core import write_text_safe
-from transcriber.icons import icon_button, info_icon
+from transcriber.icons import Tooltip, icon_button, info_icon
 from transcriber.speakers import detection_status
 from transcriber.ui_common import PALETTE, set_dark_titlebar
 from transcriber.fonts import ui_font
@@ -110,15 +109,67 @@ class PeopleMixin:
         self._backup(files)
         write_text_safe(files["speakers"], json.dumps(data))
         person = self.people.get(pid)
-        if person and info.get("voiceprint"):
-            self.people.add_voice(pid, info["voiceprint"])
+        if info.get("voiceprint"):
+            self.people.forget_voice(info["voiceprint"], keep_pid=pid)   # renamed: not the earlier person's
+        learned = False
+        if person and info.get("voiceprint") and self.people.usable_print(info["voiceprint"]):
+            clip = self._voice_clip(data, label)
+            if clip is None or clip["talk"] >= 1.5:     # too little talking makes a poor sample
+                learned = True
+                self._learn_from_transcript(pid, info["voiceprint"], clip)
         rewrite_from_speakers(files["speakers"], files, self.people)
         self._redisplay()
         self._refresh_saved(force=True)
         if person:
-            self.status_var.set(f"Labeled as {person['name']}. New recordings will recognize this voice.")
+            self.status_var.set(f"Labeled as {person['name']}. " + (
+                "New recordings will recognize this voice." if learned else
+                "(Too little talking here to learn the voice from.)"))
         else:
             self.status_var.set("Name removed.")
+
+    def _voice_clip(self, data, label):
+        """Where this speaker talks longest in the recording: {"file", "start", "end", "stream",
+        "talk" (their total talking, seconds), "title"}. None if the recording isn't here."""
+        segs = [x for x in data.get("segments", []) if x.get("speaker") == label]
+        src = data.get("source")
+        if not segs or not src or not os.path.exists(src):
+            return None
+        talk = sum(max(float(x["end"]) - float(x["start"]), 0) for x in segs)
+        best = max(segs, key=lambda x: float(x["end"]) - float(x["start"]))
+        offset, stream = 0.0, None
+        item = self._shown_item() or {}
+        if item.get("session"):
+            from transcriber.session import read_session
+            for f in (read_session(item["session"]) or {}).get("files") or []:
+                if os.path.normcase(f.get("path", "")) == os.path.normcase(src):
+                    offset = float(f.get("offset", 0))
+        elif data.get("track"):
+            stream = self._source_track_index(src, data["track"])
+        a = float(best["start"]) - offset
+        return {"file": src, "start": a, "end": min(float(best["end"]) - offset, a + 12), "stream": stream,
+                "talk": talk, "title": item.get("key") or os.path.splitext(os.path.basename(src))[0]}
+
+    def _learn_from_transcript(self, pid, voiceprint, clip):
+        """Learn a voice named in a transcript, keeping a short clip of it (cut in the background)."""
+        if clip is None:
+            self.people.add_voice(pid, voiceprint, {"from": "A transcript"})
+            return
+
+        def work():
+            from transcriber import recorder
+            from transcriber.people import new_clip_path
+            dest = new_clip_path()
+            info = {"from": clip["title"]}
+            try:
+                talk = recorder.save_clip(clip["file"], clip["start"], clip["end"], clip["stream"], str(dest))
+                info.update(audio=dest.name, seconds=round(talk, 1))
+            except Exception:
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+            self.events.put(("call", lambda: self.people.add_voice(pid, voiceprint, info)))
+        threading.Thread(target=work, daemon=True).start()
 
     def _rewrite_files_for(self, pid):
         """Update the names inside saved transcript files that mention this person."""
@@ -312,12 +363,20 @@ class PeopleMixin:
                 info.pack(side="left", padx=12)
                 ttk.Label(info, text=person["name"], font=ui_font(11, bold=True)).pack(anchor="w")
                 n = len(person.get("voices", []))
-                ttk.Label(info, text=f"{n} voice sample{'s' if n != 1 else ''}" if n else "Voice not learned yet",
-                          style="Muted.TLabel").pack(anchor="w")
+                samples = ttk.Label(info, text=f"{n} voice sample{'s' if n != 1 else ''}" if n else
+                                    "Voice not learned yet", style="Muted.TLabel", cursor="hand2" if n else "")
+                samples.pack(anchor="w")
+                if n:
+                    samples.bind("<Button-1>", lambda e, q=person: self._voice_samples_dialog(q, on_change=rebuild))
+                    samples.bind("<Enter>", lambda e, w=samples: w.configure(foreground=self._palette()["fg"]))
+                    samples.bind("<Leave>", lambda e, w=samples: w.configure(foreground=""))
+                    Tooltip(samples, "See, play or remove voice samples")
                 icon_button(row, self, "delete", "Delete person",
                             lambda pid=person["id"]: remove(pid)).pack(side="right")
                 icon_button(row, self, "mic", "Record a voice sample",
                             lambda q=person: self._record_voice_dialog(q, on_saved=rebuild)).pack(side="right", padx=(6, 0))
+                ttk.Button(row, text="Samples", command=lambda q=person: self._voice_samples_dialog(
+                    q, on_change=rebuild)).pack(side="right", padx=(6, 0))
                 ttk.Button(row, text="Edit", command=lambda q=person: self._new_person_dialog(
                     on_created=lambda pid: (self._redisplay(), rebuild()), person=q)).pack(side="right", padx=6)
 
@@ -338,11 +397,216 @@ class PeopleMixin:
         bottom.pack(fill="x", pady=(14, 0))
         ttk.Button(bottom, text="Add person...", command=lambda: self._new_person_dialog(
             on_created=lambda pid: (rebuild(), self._redisplay()))).pack(side="left")
+        ttk.Button(bottom, text="Colors...", command=self._people_colors_dialog).pack(side="left", padx=8)
         ttk.Button(bottom, text="Done", style="Accent.TButton", command=win.destroy).pack(side="right")
         win.bind("<Escape>", lambda e: win.destroy())
         win.update_idletasks()
         x = self.winfo_rootx() + (self.winfo_width() - win.winfo_reqwidth()) // 2
         y = self.winfo_rooty() + 70
+        win.geometry(f"+{x}+{y}")
+        set_dark_titlebar(win, self.current_theme == "dark")
+
+    def _people_colors_dialog(self):
+        """Each person's color (their name, captions, photo ring and talk-time bar): pick one of the
+        app's colors or any color."""
+        from tkinter import colorchooser
+        from transcriber.people import PERSON_COLORS
+        if getattr(self, "_colors_win", None) and self._colors_win.winfo_exists():
+            self._colors_win.lift()
+            return
+        win = tk.Toplevel(self)
+        self._colors_win = win
+        win.title("People's colors")
+        win.transient(self)
+        win.resizable(False, False)
+        frame = ttk.Frame(win, padding=(22, 18))
+        frame.pack(fill="both", expand=True)
+        head = ttk.Frame(frame)
+        head.pack(anchor="w", pady=(0, 10))
+        ttk.Label(head, text="People's colors", style="Section.TLabel").pack(side="left")
+        info_icon(head, self, "Used for their name, their captions (Settings > Captions > Speaker color) "
+                              "and their picture when there's no photo.").pack(side="left", padx=6)
+        listing = ttk.Frame(frame)
+        listing.pack(fill="x")
+        size = max(int(32 * self.ui_scale), 26)
+        sw = max(int(22 * self.ui_scale), 18)
+        p = self._palette()
+
+        def apply(pid, color):
+            self.people.set_color(pid, color)
+            self.avatars.clear()
+            rebuild()
+            self._redisplay()
+
+        def custom(person):
+            got = colorchooser.askcolor(color=person.get("color") or "#3b82f6", parent=win,
+                                        title=f"{person['name']}'s color")
+            if got and got[1]:
+                apply(person["id"], got[1])
+
+        def rebuild():
+            for w in listing.winfo_children():
+                w.destroy()
+            if not self.people.people:
+                ttk.Label(listing, text="No one yet. Add people in People.", style="Muted.TLabel").pack(anchor="w")
+            for person in sorted(self.people.people, key=lambda q: q["name"].lower()):
+                row = ttk.Frame(listing)
+                row.pack(fill="x", pady=3)
+                ttk.Label(row, image=self.avatars.get(person, size)).pack(side="left")
+                ttk.Label(row, text=person["name"], width=14, font=ui_font(10, bold=True)).pack(side="left", padx=10)
+                cur = (person.get("color") or "").lower()
+                for c in PERSON_COLORS + ([cur] if cur and cur not in PERSON_COLORS else []):
+                    picked = c == cur
+                    s = tk.Canvas(row, width=sw, height=sw, highlightthickness=0, background=p["bg"], cursor="hand2")
+                    s.create_oval(2, 2, sw - 2, sw - 2, fill=c, outline=p["fg"] if picked else c, width=2 if picked else 1)
+                    if picked:
+                        s.create_text(sw / 2, sw / 2, text="\u2713", fill="#ffffff", font=ui_font(8, bold=True))
+                    s.bind("<Button-1>", lambda e, pid=person["id"], c=c: apply(pid, c))
+                    s.pack(side="left", padx=2)
+                ttk.Button(row, text="Other...", command=lambda q=person: custom(q)).pack(side="left", padx=(8, 0))
+
+        rebuild()
+        ttk.Button(frame, text="Done", style="Accent.TButton", command=win.destroy).pack(anchor="e", pady=(14, 0))
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_reqwidth()) // 2
+        win.geometry(f"+{x}+{self.winfo_rooty() + 90}")
+        set_dark_titlebar(win, self.current_theme == "dark")
+
+    def _voice_samples_dialog(self, person, on_change=None):
+        """A person's voice samples: where each came from, a play button where a clip was kept, and
+        a warning on any that doesn't sound like the others (likely someone else, or silence)."""
+        from transcriber import recorder
+        from transcriber.people import ODD_ONE_OUT, VOICE_DIR
+        pid = person["id"]
+        win = tk.Toplevel(self)
+        win.title(f"{person['name']}'s voice samples")
+        win.transient(self)
+        frame = ttk.Frame(win, padding=(22, 18))
+        frame.pack(fill="both", expand=True)
+        head = ttk.Frame(frame)
+        head.pack(anchor="w", pady=(0, 10))
+        ttk.Label(head, text=f"{person['name']}'s voice samples", style="Section.TLabel").pack(side="left")
+        info_icon(head, self, "Each sample teaches the app this voice. Remove any that's someone else or "
+                              "silence: a warning means it doesn't sound like the other samples.").pack(side="left", padx=6)
+        p = self._palette()
+        style = ttk.Style(self)
+        style.configure("Voices.Treeview", rowheight=int(26 * self.ui_scale))
+        cols = ("from", "added", "talk", "match")
+        tree = ttk.Treeview(frame, columns=cols, show="headings", height=8, selectmode="extended",
+                            style="Voices.Treeview")
+        for c, title, w in (("from", "From", 240), ("added", "Added", 180), ("talk", "Talking", 70),
+                            ("match", "Sounds like them?", 130)):
+            tree.heading(c, text=title, anchor="w")
+            tree.column(c, width=int(w * self.ui_scale), anchor="w", stretch=c == "from")
+        tree.tag_configure("odd", foreground=p["err"])
+        tree.pack(fill="both", expand=True)
+        note = tk.StringVar()
+        ttk.Label(frame, textvariable=note, style="Muted.TLabel", wraplength=int(600 * self.ui_scale),
+                  justify="left").pack(anchor="w", pady=(6, 0))
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(12, 0))
+        play_btn = ttk.Button(buttons, text="Play")
+        play_btn.pack(side="left")
+        del_btn = ttk.Button(buttons, text="Remove")
+        del_btn.pack(side="left", padx=8)
+        ttk.Button(buttons, text="Close", style="Accent.TButton", command=lambda: close()).pack(side="right")
+        ttk.Button(buttons, text="Record another...", command=lambda: self._record_voice_dialog(
+            self.people.get(pid) or person, on_saved=lambda: (fill(), on_change and on_change()))).pack(side="right", padx=8)
+        state = {"stop": None}
+
+        def when(text):
+            try:
+                import datetime
+                d = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M")
+                return d.strftime("%b %d, %Y %I:%M %p").replace(" 0", " ")
+            except (TypeError, ValueError):
+                return "Earlier"
+
+        def fill():
+            if not win.winfo_exists():
+                return
+            tree.delete(*tree.get_children())
+            samples = self.people.voice_samples(pid)
+            fits = self.people.voice_fit(pid)
+            odd = 0
+            for k, ((_vp, info), fit) in enumerate(zip(samples, fits)):
+                bad = fit is not None and fit < ODD_ONE_OUT
+                odd += bad
+                match = "" if fit is None else "No" if bad else "Yes"
+                talk = f"{info['seconds']:.0f} s" if info.get("seconds") else ""
+                tree.insert("", "end", iid=str(k), values=(info.get("from") or "Earlier sample", when(info.get("added")),
+                                                           talk, match), tags=("odd",) if bad else ())
+            if not samples:
+                note.set("No samples left. Record one, or name this person in a transcript.")
+            elif odd:
+                note.set("Play the ones in red: if it isn't them (or it's silent), remove it." if len(samples) > 2 else
+                         "These two don't sound alike, so one may be someone else. Play them and remove the wrong "
+                         "one, or record another so the app can tell which is off.")
+            else:
+                note.set("Older samples have no recording to play." if any(
+                    not i.get("audio") for _v, i in samples) else "")
+            update_buttons()
+
+        def picked():
+            return sorted(int(i) for i in tree.selection())
+
+        def clip_of(k):
+            samples = self.people.voice_samples(pid)
+            name = samples[k][1].get("audio") if k < len(samples) else None
+            path = VOICE_DIR / name if name else None
+            return path if path and path.exists() else None
+
+        def update_buttons(_e=None):
+            ks = picked()
+            play_btn.configure(state="normal" if len(ks) == 1 and clip_of(ks[0]) else "disabled")
+            del_btn.configure(state="normal" if ks else "disabled")
+
+        def stop_playing():
+            if state["stop"]:
+                try:
+                    state["stop"]()
+                except Exception:
+                    pass
+                state["stop"] = None
+
+        def play(_e=None):
+            ks = picked()
+            path = clip_of(ks[0]) if len(ks) == 1 else None
+            if not path:
+                return
+            stop_playing()
+            try:
+                state["stop"] = recorder.play_wav(str(path))
+            except Exception as exc:
+                note.set(f"Couldn't play it: {exc}")
+
+        def remove(_e=None):
+            ks = picked()
+            if not ks:
+                return
+            stop_playing()
+            for k in reversed(ks):
+                self.people.remove_voice(pid, k)
+            fill()
+            if on_change:
+                on_change()
+
+        def close():
+            stop_playing()
+            win.destroy()
+
+        play_btn.configure(command=play)
+        del_btn.configure(command=remove)
+        tree.bind("<<TreeviewSelect>>", update_buttons)
+        tree.bind("<Double-1>", play)
+        tree.bind("<Delete>", remove)
+        win.bind("<Escape>", lambda e: close())
+        win.protocol("WM_DELETE_WINDOW", close)
+        fill()
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_reqwidth()) // 2
+        y = self.winfo_rooty() + 90
         win.geometry(f"+{x}+{y}")
         set_dark_titlebar(win, self.current_theme == "dark")
 
@@ -461,7 +725,9 @@ class PeopleMixin:
         record_btn.pack(side="right")
         close_btn = ttk.Button(buttons, text="Close")
         close_btn.pack(side="right", padx=(0, 8))
-        state = {"rec": None, "busy": False}
+        play_btn = ttk.Button(buttons, text="Play")             # shown while reviewing a recording
+        discard_btn = ttk.Button(buttons, text="Discard")
+        state = {"rec": None, "busy": False, "pending": None, "stop_play": None, "length": 0.0}
 
         def tick():
             rec = state["rec"]
@@ -475,7 +741,10 @@ class PeopleMixin:
             w = meter.winfo_width()
             meter.delete("all")
             meter.create_rectangle(0, 0, w * rec.level(), 8, width=0, fill="#3b82f6")
-            if secs >= 15:
+            state["loudest"] = max(state.get("loudest", 0.0), rec.level())
+            if secs >= 3 and state["loudest"] < 0.02:
+                status.set("Not hearing anything from this device. Stop, and pick another one above.")
+            elif secs >= 15:
                 status.set("That's enough for a good sample. Press Stop whenever you're done.")
             if secs >= 90:
                 stop()
@@ -487,7 +756,7 @@ class PeopleMixin:
             names = [n for _, n in ids]
             dev = ids[names.index(device_var.get())][0] if device_var.get() in names else None
             rec = recorder.Recorder(kind.get(), dev)
-            state["rec"] = rec
+            state["rec"], state["loudest"] = rec, 0.0
             rec.start()
             record_btn.configure(text="Stop", command=stop)
             device_box.configure(state="disabled")
@@ -509,8 +778,68 @@ class PeopleMixin:
             if rec.seconds() < 4:
                 status.set("That was too short. Record at least 5 seconds.")
                 return
-            wav = os.path.join(tempfile.gettempdir(), f"voice-sample-{person['id']}.wav")
-            rec.save_wav(wav)
+            peak, talk = rec.heard()
+            problem = recorder.problem_with(peak, talk)
+            if problem:                                 # silence makes a useless voiceprint: not kept
+                status.set(f"Not saved. {problem}")
+                return
+            from transcriber.people import new_clip_path
+            wav = str(new_clip_path())
+            state["length"] = rec.save_wav(wav)
+            state["talk"], state["pending"] = talk, wav
+            play_btn.pack(side="left")
+            discard_btn.pack(side="left", padx=8)
+            record_btn.configure(text="Save", command=submit)
+            device_box.configure(state="disabled")
+            status.set("Listen back if you like, then Save it, or Discard and record again.")
+
+        def stop_playing():
+            if state["stop_play"]:
+                try:
+                    state["stop_play"]()
+                except Exception:
+                    pass
+                state["stop_play"] = None
+            if play_btn.winfo_exists():
+                play_btn.configure(text="Play", command=play)
+
+        def play():
+            if not state["pending"]:
+                return
+            stop_playing()
+            try:
+                state["stop_play"] = recorder.play_wav(state["pending"])
+            except Exception as exc:
+                status.set(f"Couldn't play it: {exc}")
+                return
+            play_btn.configure(text="Stop", command=stop_playing)
+            token_ = state["stop_play"]
+            win.after(int(state["length"] * 1000) + 300,
+                      lambda: state["stop_play"] is token_ and stop_playing())
+
+        def end_review():
+            stop_playing()
+            state["pending"] = None
+            play_btn.pack_forget()
+            discard_btn.pack_forget()
+            device_box.configure(state="readonly")
+            record_btn.configure(text="Record", command=start)
+
+        def discard():
+            wav = state["pending"]
+            end_review()
+            if wav:
+                try:
+                    os.remove(wav)
+                except OSError:
+                    pass
+            status.set("Discarded. Press Record to try again.")
+
+        def submit():
+            wav = state["pending"]
+            if not wav:
+                return
+            end_review()
             state["busy"] = True
             record_btn.configure(state="disabled")
             status.set("Learning the voice...")
@@ -522,23 +851,27 @@ class PeopleMixin:
                     err = None
                 except Exception as e:
                     vp, err = None, str(e) or type(e).__name__
+                self.events.put(("call", lambda: finish(vp, err, wav)))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def finish(vp, err, wav):
+            state["busy"] = False
+            info = {"from": "Recorded (PC audio)" if kind.get() == "pc" else "Recorded (mic)",
+                    "audio": os.path.basename(wav), "seconds": round(state.get("talk", 0.0), 1)}
+            kept = not err and self.people.add_voice(person["id"], vp, info)
+            if not kept:
                 try:
                     os.remove(wav)
                 except OSError:
                     pass
-                self.events.put(("call", lambda: finish(vp, err)))
-
-            threading.Thread(target=work, daemon=True).start()
-
-        def finish(vp, err):
-            state["busy"] = False
             if not win.winfo_exists():
                 return
             record_btn.configure(state="normal")
-            if err:
-                status.set(f"Couldn't learn the voice: {err}")
+            if not kept:
+                status.set(f"Couldn't learn the voice: {err}" if err else
+                           "Not saved: no voice could be read from that. Try again a little louder.")
                 return
-            self.people.add_voice(person["id"], vp)
             n = len((self.people.get(person["id"]) or {}).get("voices", []))
             status.set(f"Saved. {person['name']} now has {n} voice sample{'s' if n != 1 else ''}. "
                        "Record again for better recognition, or Close.")
@@ -551,9 +884,14 @@ class PeopleMixin:
             if state["rec"] is not None:
                 state["rec"].stop()
                 state["rec"] = None
+            if state["pending"]:                     # recorded but never saved: not kept
+                discard()
+            stop_playing()
             win.destroy()
 
         record_btn.configure(command=start)
+        play_btn.configure(command=play)
+        discard_btn.configure(command=discard)
         close_btn.configure(command=close)
         win.protocol("WM_DELETE_WINDOW", close)
         win.bind("<Escape>", lambda e: close())
@@ -565,11 +903,51 @@ class PeopleMixin:
         set_dark_titlebar(win, self.current_theme == "dark")
         win.grab_set()
 
+    def _view_menu(self, menu, line):
+        """Lines / Paragraphs choices at the end of a row's right-click menu."""
+        menu.add_separator()
+        if self.transcript_view == "paragraphs":
+            groups = getattr(self, "_group_lines", {})
+            gl = next((g for g, info in groups.items() if info["open"] and info["key"] in self._expanded
+                       and g <= line < g + len(info["metas"])), None)      # one text line per row when open
+            if gl is not None:
+                menu.add_command(label="Fold this paragraph", command=lambda: self._toggle_paragraph(gl, False))
+            menu.add_command(label="Open all paragraphs", command=lambda: self._expand_all(True))
+            menu.add_command(label="Fold all paragraphs", command=lambda: self._expand_all(False))
+            menu.add_command(label="Show line by line", command=lambda: self._set_view("lines"))
+        else:
+            menu.add_command(label="Show as paragraphs", command=lambda: self._set_view("paragraphs"))
+        on = bool(getattr(self, "ts_millis", False))
+        menu.add_command(label="Timestamps without milliseconds" if on else "Timestamps with milliseconds",
+                         command=lambda: self._set_ts_millis(not on))
+
     def _on_row_menu(self, event):
         idx = self.text.index(f"@{event.x},{event.y}")
         line = int(idx.split(".")[0])
+        if "tsend" in self.text.tag_names(f"{line}.0"):          # a folded paragraph's second line
+            line -= 1
+        return self._row_menu(line, event.x_root, event.y_root)
+
+    def _row_menu(self, line: int, x_root: int, y_root: int, short: bool = False, clip_range=None):
+        """The right-click menu of a transcript row. short: the timeline's, just the everyday items
+        (edit, who's speaking, mark, delete), plus Export clip when clip_range (the marked stretch) is given."""
         meta = self._row_meta.get(line)
         if not meta:
+            if line in getattr(self, "_group_lines", {}):      # a folded paragraph
+                p = self._palette()
+                dark = self.current_theme == "dark"
+                menu = tk.Menu(self, tearoff=0, background="#2b2b2b" if dark else "#ffffff", foreground=p["fg"],
+                               activebackground=p["hover"], activeforeground=p["fg"], relief="flat", borderwidth=1,
+                               font=ui_font(10))
+                menu.add_command(label="Show its lines", command=lambda: self._toggle_paragraph(line, True))
+                menu.add_command(label="Copy text", command=lambda: (
+                    self.clipboard_clear(), self.clipboard_append(" ".join(m["orig"] for m in self._group_lines[line]["metas"]))))
+                self._view_menu(menu, line)
+                self._set_hover(line)
+                try:
+                    menu.tk_popup(x_root, y_root)
+                finally:
+                    menu.grab_release()
             return "break"
         if self._editing is not None and self._editing != line:
             self._end_edit()
@@ -593,16 +971,36 @@ class PeopleMixin:
                 cur_person = (spk.get(current) or {}).get("person")
                 names = display_names(data, self.people)
                 who = tk.Menu(menu, tearoff=0, **colors)
-                for person in sorted(self.people.people, key=lambda q: q["name"].lower()):
-                    who.add_command(label=person["name"] + ("   ✓" if person["id"] == cur_person else ""),
-                                    command=lambda pid=person["id"]: self._assign_line(files, meta["i"], pid=pid))
+                # the people in this transcript first (with their pictures); everyone else under Other
+                in_use = self._people_in_use()
+                size = max(int(18 * self.ui_scale), 16)
+                self._menu_images = []                           # (Tk drops images nobody holds)
+
+                def add_person(m, person):
+                    img = self.avatars.get(person, size, person["name"], person["color"])
+                    self._menu_images.append(img)
+                    m.add_command(label="  " + person["name"] + ("   \u2713" if person["id"] == cur_person else ""),
+                                  image=img, compound="left",
+                                  command=lambda pid=person["id"]: self._assign_line(files, meta["i"], pid=pid))
+                for pid in in_use:
+                    person = self.people.get(pid)
+                    if person:
+                        add_person(who, person)
                 others = [lab for lab in names if lab != current
                           and not self.people.get((spk.get(lab) or {}).get("person"))]
-                if others:
-                    who.add_separator()
-                    for lab in others:
-                        who.add_command(label=names[lab],
-                                        command=lambda lab=lab: self._assign_line(files, meta["i"], label=lab))
+                for lab in others:                                # speakers here with no person yet
+                    img = self.avatars.get(None, size, names[lab], "#64748b")
+                    self._menu_images.append(img)
+                    who.add_command(label="  " + names[lab], image=img, compound="left",
+                                    command=lambda lab=lab: self._assign_line(files, meta["i"], label=lab))
+                rest = [q for q in sorted(self.people.people, key=lambda q: q["name"].lower()) if q["id"] not in in_use]
+                if rest:
+                    if in_use or others:
+                        who.add_separator()
+                    other = tk.Menu(who, tearoff=0, **colors)
+                    for person in rest:
+                        add_person(other, person)
+                    who.add_cascade(label="Other", menu=other)
                 who.add_separator()
                 who.add_command(label="New person...", command=lambda: self._new_person_dialog(
                     lambda pid: self._assign_line(files, meta["i"], pid=pid)))
@@ -612,6 +1010,19 @@ class PeopleMixin:
         menu.add_command(label="Remove mark" if marked and not sel else ("Mark selection" if sel else "Mark"),
                          accelerator="M", command=(lambda: self._mark_selection()) if sel else
                          (lambda: self._toggle_mark(line)))
+        if short:
+            if clip_range:
+                menu.add_command(label="Export clip...",
+                                 command=lambda: self._clip_dialog(line, start=clip_range[0], end=clip_range[1]))
+            menu.add_separator()
+            menu.add_command(label="Restore line" if deleted else "Delete line",
+                             command=lambda: self._toggle_delete(line))
+            self._set_hover(line)
+            try:
+                menu.tk_popup(x_root, y_root)
+            finally:
+                menu.grab_release()
+            return "break"
         suspects = getattr(self, "_suspect_rows", {})
         if line in suspects and not deleted:
             menu.add_command(label="Remove made-up words", command=lambda: self._remove_madeup([line]))
@@ -643,12 +1054,33 @@ class PeopleMixin:
         menu.add_separator()
         menu.add_command(label="Restore line" if deleted else "Delete line",
                          command=lambda: self._toggle_delete(line))
+        self._view_menu(menu, line)
         self._set_hover(line)
         try:
-            menu.tk_popup(event.x_root, event.y_root)
+            menu.tk_popup(x_root, y_root)
         finally:
             menu.grab_release()
         return "break"
+
+    def _people_in_use(self) -> list:
+        """The people assigned somewhere in the shown transcript (every part), in the order they
+        first appear."""
+        out, seen_files = [], set()
+        for meta in self._all_row_metas():
+            files = meta.get("files") or {}
+            fkey = str(files.get("speakers") or "")
+            if not fkey or fkey in seen_files:
+                continue
+            seen_files.add(fkey)
+            try:
+                _segs, data = self._tl_segments(files)
+            except Exception:
+                continue
+            for lab, info in ((data or {}).get("speakers") or {}).items():
+                pid = (info or {}).get("person")
+                if pid and pid not in out and self.people.get(pid):
+                    out.append(pid)
+        return out
 
     def _assign_line(self, files, i, pid=None, label=None):
         """Fix who's speaking on one line only (that speaker's other lines stay as they are)."""

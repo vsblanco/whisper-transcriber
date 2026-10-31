@@ -20,7 +20,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-MODELS = ["tiny", "base", "small", "medium", "large", "turbo"]
+MODELS = ["tiny", "base", "small", "medium", "large", "turbo", "parakeet"]
+PARAKEET = "parakeet"       # NVIDIA Parakeet (nvidia_worker.py), not a Whisper model
+# The languages Parakeet knows (it tells them apart by itself)
+PARAKEET_LANGUAGES = {"bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it", "lv", "lt",
+                      "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk"}
 MEDIA_EXTENSIONS = {
     ".mp4", ".mkv", ".mov", ".m4v", ".avi", ".webm", ".wmv", ".flv",
     ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma",
@@ -40,6 +44,8 @@ class Segment:
     end: float
     text: str
     words: list = field(default_factory=list)   # [(start, end, word), ...] when known
+    fixed: bool = False      # its start and end were set by hand (the timeline): captions keep them exactly
+    layer: Optional[int] = None   # caption spot picked by hand on the timeline (0 usual, 1, 2 stacked above)
 
 
 @dataclass
@@ -351,6 +357,9 @@ def _faster_name(name: str) -> str:
 
 def model_is_downloaded(name: str) -> bool:
     """True if this model is already downloaded for the engine in use."""
+    if name == PARAKEET:
+        from transcriber import nvidia_worker
+        return nvidia_worker.downloaded(nvidia_worker.PARAKEET_ID)
     try:
         if engine() == "faster":
             from faster_whisper.utils import _MODELS
@@ -366,7 +375,17 @@ def model_is_downloaded(name: str) -> bool:
 
 
 def is_model_loaded(name: str) -> bool:
+    if name == PARAKEET:
+        from transcriber import nvidia_worker
+        return nvidia_worker.is_loaded("parakeet")
     return f"{engine()}:{name}" in _model_cache
+
+
+def nvidia_in_process() -> bool:
+    """The NVIDIA models run in this Python (the Python version with torch and transformers);
+    otherwise in the speaker detection add-on's Python."""
+    from transcriber import nvidia_worker
+    return not getattr(sys, "frozen", False) and not nvidia_worker.missing()
 
 
 def load_model(
@@ -379,6 +398,11 @@ def load_model(
     on_download(bytes_done, bytes_total) is called while a first-time download is running
     (OpenAI engine; faster-whisper downloads show as a message).
     """
+    if name == PARAKEET:
+        if nvidia_in_process():
+            from transcriber import nvidia_worker
+            return nvidia_worker.load("parakeet", "", log)
+        return None                               # (loads in the add-on's Python when it runs)
     with _model_lock:
         if engine() == "faster":
             return _load_faster(name, log)
@@ -526,6 +550,16 @@ def split_words(text: str) -> list:
     return [w.strip() for w in re.split(r"[,\n;]+", text or "") if w.strip()]
 
 
+# Settings > Captions > "Write sounds": let Whisper write sounds like [laughs] and [music] (it
+# normally leaves out everything that isn't words). It catches some of them, not all.
+KEEP_SOUNDS = False
+EXTRACT_SPEECH = False      # Demucs pulls the voice out of each track before Whisper hears it (speech.py)
+
+
+def _sound_prompt(prompt):
+    return ((prompt + " ") if prompt else "") + "[laughs]" if KEEP_SOUNDS else prompt
+
+
 def _run_openai(model, audio_path, language, on_segment, should_cancel, prompt=None):
     stream = _SegmentStream(on_segment, should_cancel)
     with contextlib.redirect_stdout(stream):
@@ -535,7 +569,8 @@ def _run_openai(model, audio_path, language, on_segment, should_cancel, prompt=N
             verbose=True,                       # prints each segment; captured above
             fp16=whisper_device() == "cuda",    # fp16 only works on GPU
             word_timestamps=True,
-            initial_prompt=prompt,
+            initial_prompt=_sound_prompt(prompt),
+            **({"suppress_tokens": ""} if KEEP_SOUNDS else {}),
         )
     segments = [Segment(s["start"], s["end"], s["text"].strip(),
                         [(w["start"], w["end"], w["word"]) for w in s.get("words") or []])
@@ -557,7 +592,8 @@ def _read_wav_array(path: str):
 
 def _run_faster(model, audio_path, language, on_segment, should_cancel, prompt=None):
     gen, info = model.transcribe(_read_wav_array(audio_path), language=language or None, word_timestamps=True,
-                                 initial_prompt=prompt)
+                                 initial_prompt=_sound_prompt(prompt),
+                                 **({"suppress_tokens": []} if KEEP_SOUNDS else {}))
     segments = []
     for s in gen:                                # recognized one line at a time
         if should_cancel():
@@ -595,6 +631,11 @@ def transcribe_file(
         extract_audio(media_path, audio_path, track, clip)
         if should_cancel():
             raise TranscriptionCancelled()
+        if EXTRACT_SPEECH:
+            from transcriber import speech
+            speech.extract(audio_path, log, should_cancel)
+            if should_cancel():
+                raise TranscriptionCancelled()
 
         if not _run_lock.acquire(blocking=False):      # one transcription at a time (they share the model,
             log("Waiting for the other transcription to finish...")   # the GPU and, for OpenAI Whisper, stdout)
@@ -609,9 +650,37 @@ def transcribe_file(
             os.remove(audio_path)
 
 
+def _run_parakeet(audio_path, language, on_segment, should_cancel, log, prompt=None):
+    """Speech to text with NVIDIA Parakeet (here, or in the add-on's Python)."""
+    from transcriber import nvidia_worker
+    if prompt:
+        log("(Parakeet doesn't take a word list, so names may be spelled differently.)")
+    if language and language not in PARAKEET_LANGUAGES:
+        log(f"Parakeet doesn't know this language ({language}); a Whisper model will do better.")
+
+    def line(ln):
+        if on_segment:
+            on_segment(Segment(float(ln[0]), float(ln[1]), ln[2]))
+    if nvidia_in_process():
+        try:
+            lines = nvidia_worker.transcribe(audio_path, "", log, on_line=line, should_cancel=should_cancel)
+        except nvidia_worker.Cancelled:
+            raise TranscriptionCancelled()
+    else:
+        from transcriber import addons
+        lines = addons.run_nvidia("transcribe", audio_path, "", log, on_line=line, should_cancel=should_cancel)
+    segments = [Segment(float(a), float(b), text, [(float(x), float(y), w) for x, y, w in words])
+                for a, b, text, words in lines]
+    return segments, language or "", " ".join(sg.text for sg in segments)
+
+
 def _transcribe_locked(media_path, audio_path, model_name, language, on_segment, should_cancel, log, track,
                        track_name, speaker_token, prompt, clip) -> Transcript:
     global _gpu_broken, _use_openai_gpu
+    if model_name == PARAKEET:
+        segments, lang, text = _run_parakeet(audio_path, language, on_segment, should_cancel, log, prompt)
+        return _finish(media_path, audio_path, model_name, track, track_name, speaker_token, should_cancel, log,
+                       clip, segments, lang, text)
     model = load_model(model_name, log)
     log("Transcribing...")
     run = _run_faster if engine() == "faster" else _run_openai
@@ -633,6 +702,13 @@ def _transcribe_locked(media_path, audio_path, model_name, language, on_segment,
             log(f"The GPU couldn't be used ({exc}). Transcribing on the CPU instead. {hint}")
         model = load_model(model_name, log)
         segments, lang, text = run(model, audio_path, language, on_segment, should_cancel, prompt)
+    return _finish(media_path, audio_path, model_name, track, track_name, speaker_token, should_cancel, log, clip,
+                   segments, lang, text)
+
+
+def _finish(media_path, audio_path, model_name, track, track_name, speaker_token, should_cancel, log, clip,
+            segments, lang, text) -> Transcript:
+    """After speech to text: back onto the file's times, then who's speaking."""
     if clip:                                # back onto the file's own times
         for sg in segments:
             sg.start, sg.end = sg.start + clip[0], sg.end + clip[0]

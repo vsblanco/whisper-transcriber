@@ -6,3 +6,5 @@ python-vlc>=3.0      # video preview (optional; also needs VLC media player inst
 # Speaker detection (optional): pip install pyannote.audio   and a Hugging Face token (see README)
 # Recording voice samples in People (optional): pip install soundcard
 # About 4x faster transcription (optional): pip install faster-whisper
+# NVIDIA Parakeet and Nemotron (optional): pip install "transformers>=5.21"  (and PyTorch's GPU version for an
+#   NVIDIA card; the app's What's installed window does both)

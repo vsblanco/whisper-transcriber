@@ -7,26 +7,14 @@ from __future__ import annotations
 import os
 import tkinter as tk
 
-from transcriber.core import format_timestamp
 from transcriber.speakers import rows_for
-from transcriber.ui_common import PALETTE
 
 
 class SearchMixin:
 
     def _search_text(self) -> str:
-        """What the user typed (empty while the gray hint is showing)."""
-        return "" if self._search_placeholder else self.search_var.get()
-
-    def _search_focus(self, focused: bool):
-        if focused and self._search_placeholder:
-            self._search_placeholder = False
-            self.search_var.set("")
-            self.search_entry.configure(foreground="")      # back to the theme's normal text color
-        elif not focused and not self.search_var.get():
-            self._search_placeholder = True
-            self.search_var.set(self.SEARCH_HINT)
-            self.search_entry.configure(foreground=PALETTE[self.current_theme or "light"]["muted"])
+        """What's being searched for in the Library (Ctrl+F there)."""
+        return self.search_var.get()
 
     def _search_changed(self):
         """Typing in the search box: filter the list and show matching lines (after a short pause)."""
@@ -37,8 +25,9 @@ class SearchMixin:
 
         def run():
             self._search_job = None
-            self._search_dirty = True
+            self._search_dirty = self._tab_name() == "transcript"    # (matching lines: on Enter, or when seen)
             self._refresh_saved(force=True)
+            self._find_library_count()
             if not self._search_text().strip() and self.display and self.display[0] == "search":
                 sel = self.saved.selection()
                 self._show_saved(sel[0] if sel else None)
@@ -83,7 +72,7 @@ class SearchMixin:
             for sec, name, text in hits:
                 if count >= limit:
                     break
-                entries.append((f"[{format_timestamp(sec)}]  ", "ts"))
+                entries.append((f"[{self._ts(sec)}]  ", "ts"))
                 if name:
                     entries.append((f"{name}:  ", "spk0"))
                 entries.append((text + "\n", "hit", None, ("search", iids.get(tr["key"]), sec, text)))
@@ -117,6 +106,12 @@ class SearchMixin:
         self.text.tag_remove("find", "1.0", "end")
 
         def land():
+            for gl, info in list(getattr(self, "_group_lines", {}).items()):
+                if not info["open"] and any(m.get("orig") == text and int(m.get("sec", -1)) == int(sec)
+                                            for m in info["metas"]):
+                    self._expanded.add(info["key"])
+                    self._redisplay()
+                    break
             for line, meta in self._row_meta.items():
                 if meta.get("orig") == text and int(meta.get("sec", -1)) == int(sec):
                     self._set_now(line)

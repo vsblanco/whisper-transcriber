@@ -202,6 +202,8 @@ class TracksMixin:
         t.tag_remove("mutedrow", "1.0", "end")
         muted = getattr(self, "_muted_tracks", set())
         self._muted_lines = {line for line, meta in self._row_meta.items() if meta.get("track") in muted}
+        self._muted_lines |= {line for line, info in getattr(self, "_group_lines", {}).items()
+                              if not info["open"] and info["metas"] and info["metas"][0].get("track") in muted}
         for line in self._muted_lines:
             t.tag_add("mutedrow", f"{line}.0", f"{line}.0 lineend +1c")
         if self._muted_lines:

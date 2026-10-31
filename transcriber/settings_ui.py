@@ -104,6 +104,16 @@ class SettingsMixin:
         for key, label in (("txt", "Text"), ("srt", "SRT subtitles"), ("vtt", "VTT subtitles")):
             ttk.Checkbutton(fr, text=label, variable=self.fmt_vars[key]).pack(side="left", padx=(0, 12))
         line("Save as", fr)
+        from transcriber import speech
+        sp = ttk.Frame(frame)
+        have = speech.available()
+        ttk.Checkbutton(sp, text="Extract speech first" + ("" if have else "  (needs: pip install demucs)"),
+                        variable=self.extract_speech, state="normal" if have else "disabled").pack(side="left")
+        info_icon(sp, self, "Before Whisper hears a track, Demucs pulls the voice out of it and leaves game sound, "
+                            "music and room noise behind: cleaner words from noisy recordings. It separates voice "
+                            "from everything else, not one person from another, so another person caught by the "
+                            "same mic is still there. Slow without a GPU; the first run downloads the model (about 80 MB).").pack(side="left", padx=4)
+        line("", sp)
         line("Save to", ttk.Entry(frame, textvariable=self.out_var, width=42), pady=(5, 2), sticky="ew")
         out = ttk.Frame(frame)
         ttk.Button(out, text="Change folder...", command=lambda: self._choose_output(win)).pack(side="left")
@@ -118,6 +128,27 @@ class SettingsMixin:
         info_icon(det, self, "After each transcription, labels every line with who's talking. Click a name to "
                              "say who it is. Needs pyannote.audio and a Hugging Face token.").pack(side="left", padx=4)
         line("", det)
+        from transcriber.speakers import SPEAKER_MODELS, set_speaker_model
+        smrow = ttk.Frame(frame)
+        sm_var = tk.StringVar(value=SPEAKER_MODELS.get(self.speaker_model, SPEAKER_MODELS["pyannote"]))
+        smcb = ttk.Combobox(smrow, textvariable=sm_var, values=list(SPEAKER_MODELS.values()), state="readonly",
+                            width=44)
+        smcb.pack(side="left")
+        info_icon(smrow, self, "pyannote handles any number of people. NVIDIA Nemotron 3 is newer, notices people "
+                               "talking over each other, and handles up to 8 people (fast on an NVIDIA card; "
+                               "needs the NVIDIA models in What's installed). People are recognized the same way "
+                               "with either.").pack(side="left", padx=4)
+
+        def speaker_model_picked(_e=None):
+            self.speaker_model = next(k for k, v in SPEAKER_MODELS.items() if v == sm_var.get())
+            set_speaker_model(self.speaker_model)
+            save_settings(self._settings())
+            if self.speaker_model == "nemotron":
+                from transcriber import setup_check
+                if not setup_check._nvidia_component()["ok"]:
+                    self.after(50, lambda: self._open_setup("nvidia"))
+        smcb.bind("<<ComboboxSelected>>", speaker_model_picked)
+        line("Speaker model", smrow)
         tok = ttk.Frame(frame)
         tok_entry = ttk.Entry(tok, textvariable=self.hf_token, width=36, show="\u2022")
         tok_entry.pack(side="left")
@@ -169,15 +200,21 @@ class SettingsMixin:
         # ---- Deleting
         # ---- Captions (the player's subtitles)
         section("Captions")
-        from transcriber.player import DEFAULT_CAPTIONS
+        from transcriber.player import DEFAULT_CAPTIONS, SIZE_PERCENTS, size_percent
         style = {**DEFAULT_CAPTIONS, **self.caption_style}
+        style["size"] = size_percent(style)            # (older settings said small / medium / large)
+        if style["size"] not in SIZE_PERCENTS:
+            style["size"] = min(SIZE_PERCENTS, key=lambda p: abs(p - style["size"]))
         choices = {
             "mode": ("Style", {"below": "Below the video", "overlay": "On the video (movie style)"}),
-            "size": ("Size", {"small": "Small", "medium": "Medium", "large": "Large", "xlarge": "Extra large"}),
+            "size": ("Size", {p: f"{p}%" for p in SIZE_PERCENTS}),
             "background": ("Background", {"box": "See-through box", "solid": "Solid box", "outline": "Outline",
                                           "shadow": "Shadow"}),
             "color": ("Text color", {"white": "White", "yellow": "Yellow", "gray": "Light gray"}),
+            "speaker": ("Speaker color", {"name": "Name only", "text": "Text in their color",
+                                          "box": "Box in their color"}),
             "position": ("Position", {"bottom": "Bottom", "top": "Top"}),
+            "overlap": ("Talking at once", {"layer": "Stacked (one caption each)", "dash": "One caption with dashes"}),
         }
         boxes = {}
 
@@ -186,31 +223,114 @@ class SettingsMixin:
                 picked = boxes[key].get()
                 style[key] = next((k for k, v in opts.items() if v == picked), style.get(key))
             style["names"] = names_var.get()
+            for key, var in rule_vars.items():
+                style[key] = var.get()
             on_video = style["mode"] == "overlay"
             for key in ("background", "position"):
                 boxes[key].configure(state="readonly" if on_video else "disabled")
+            split_changed = (style.get("split") != self.caption_style.get("split", True)
+                             or style.get("overlap") != self.caption_style.get("overlap", "layer"))
             self.caption_style = dict(style)
             self.player.set_caption_style(self.caption_style)
+            self._apply_caption_options()
             save_settings(self._settings())
+            if split_changed and getattr(self, "display", None):
+                self._redisplay()                  # the player's captions follow the setting
 
         for key, (label, opts) in choices.items():
-            holder = ttk.Frame(frame) if key == "mode" else frame
+            holder = ttk.Frame(frame) if key in ("mode", "speaker", "overlap") else frame
             cb = ttk.Combobox(holder, values=list(opts.values()), state="readonly", width=24 if key == "mode" else 16)
             cb.set(opts.get(style.get(key), next(iter(opts.values()))))
             cb.bind("<<ComboboxSelected>>", caption_changed)
             boxes[key] = cb
+            if key == "speaker":
+                cb.pack(side="left")
+                ttk.Button(holder, text="Colors...", command=self._people_colors_dialog).pack(side="left", padx=(6, 0))
+                info_icon(holder, self, "Each person's color (People > their color) on their captions: just the "
+                                        "name, all the text, or a box behind it. Also used in burned-in clips."
+                          ).pack(side="left", padx=6)
+                line(label, holder)
+                continue
             if key == "mode":
                 cb.pack(side="left")
                 info_icon(holder, self, "On the video puts the captions on the picture like a movie, in fullscreen "
                                         "too. Background and Position apply to that style. Audio files keep the "
                                         "strip below.").pack(side="left", padx=6)
                 line(label, holder)
+            elif key == "overlap":
+                cb.pack(side="left")
+                info_icon(holder, self, "When two or three people talk at once: Stacked gives each their own "
+                                        "caption, one above the other, with its own name, color and timing "
+                                        "(up to 3). Dashes puts both in one caption with a dash each, the old "
+                                        "TV way, when both are short. Plain .srt files always use dashes. On the "
+                                        "timeline, drag a line up to stack it by hand.").pack(side="left", padx=6)
+                line(label, holder)
             else:
                 line(label, cb)
         names_var = tk.BooleanVar(value=style.get("names", True))
         line("", ttk.Checkbutton(frame, text="Show speaker names", variable=names_var, command=caption_changed))
+        rule_vars = {}
+        for key, text, tip in (
+                ("split", "Caption-sized pieces",
+                 "Up to 2 lines of 42 characters and 7 seconds each, broken at natural places and timed by "
+                 "the words, like TV and streaming captions. In the player, caption files and exports."),
+                ("cuts", "Line up with scene cuts",
+                 "In exports from a video, captions start and end on a nearby cut instead of just before or "
+                 "after it. Only for stretches up to 30 minutes (it reads every frame)."),
+                ("sounds", "Write sounds like [laughs]",
+                 "New transcripts also note sounds such as [laughs] or [music]. Whisper catches some, not all.")):
+            rule_vars[key] = tk.BooleanVar(value=bool(style.get(key)))
+            holder = ttk.Frame(frame)
+            ttk.Checkbutton(holder, text=text, variable=rule_vars[key], command=caption_changed).pack(side="left")
+            info_icon(holder, self, tip).pack(side="left", padx=4)
+            line("", holder)
         for key in ("background", "position"):
             boxes[key].configure(state="readonly" if style.get("mode") == "overlay" else "disabled")
+
+        section("Timeline")
+        keyrow = ttk.Frame(frame)
+        key_btns = {}
+
+        def show_keys():
+            for tool, b in key_btns.items():
+                b.configure(text=self.timeline_keys[tool].upper())
+
+        def capture(tool):
+            b = key_btns[tool]
+            b.configure(text="Press a key")
+            b.focus_set()
+
+            def got(e):
+                b.unbind("<KeyPress>")
+                b.unbind("<FocusOut>")
+                k = (e.char or "").lower()
+                if e.keysym == "Escape" or not k:
+                    show_keys()
+                    return "break"
+                if not k.isalnum() or k == "m":          # (M marks a line; space plays)
+                    self.bell()
+                    self.status_var.set("Pick a letter or number (M marks a line).")
+                    show_keys()
+                    return "break"
+                for other in self.timeline_keys:
+                    if other != tool and self.timeline_keys[other] == k:   # taken by another tool: swap them
+                        self.timeline_keys[other] = self.timeline_keys[tool]
+                self.timeline_keys[tool] = k
+                save_settings(self._settings())
+                show_keys()
+                return "break"
+            b.bind("<KeyPress>", got)
+            b.bind("<FocusOut>", lambda e: (b.unbind("<KeyPress>"), b.unbind("<FocusOut>"), show_keys()))
+
+        for tool, label in (("select", "Select"), ("snip", "Snip"), ("range", "Range")):
+            ttk.Label(keyrow, text=label).pack(side="left", padx=(0 if tool == "select" else 14, 6))
+            key_btns[tool] = ttk.Button(keyrow, width=11, command=lambda t=tool: capture(t))
+            key_btns[tool].pack(side="left")
+        show_keys()
+        info_icon(keyrow, self, "Keys for the timeline's tools. Select moves and resizes lines; Snip splits a "
+                                "line in two where you click; Range marks a stretch to play or export. Click a box, then press the new key.").pack(
+            side="left", padx=6)
+        line("Tool keys", keyrow)
 
         section("Deleting")
         nas = ttk.Frame(frame)
@@ -233,6 +353,12 @@ class SettingsMixin:
         ttk.Label(un, text=f"You have version {__version__}", style="Muted.TLabel").pack(side="left")
         ttk.Button(un, text="Check now", command=lambda: self._check_updates(quiet=False)).pack(side="left", padx=8)
         line("", un)
+        from transcriber import crashlog
+        lg = ttk.Frame(frame)
+        ttk.Button(lg, text="Error logs...", command=crashlog.open_folder).pack(side="left")
+        info_icon(lg, self, "If the app crashes or something goes wrong, the details are saved here "
+                            "(nothing is sent anywhere), so the problem can be looked at.").pack(side="left", padx=4)
+        line("", lg)
 
         def close(*_):
             save_settings(self._settings())

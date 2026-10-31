@@ -5,6 +5,7 @@ A mixin for the App class in app.py."""
 
 from __future__ import annotations
 
+import sys
 import threading
 import tkinter as tk
 from tkinter import ttk
@@ -134,6 +135,30 @@ class SetupMixin:
             kind, packages, extra = c["install"]
             if kind == "addon" and not self._confirm_addon():
                 return
+            if kind == "nvidia":
+                from transcriber import addons
+                plan = addons.nvidia_install_plan()
+                if plan["torch_gpu"] and sys.platform == "win32":
+                    # PyTorch's files are in use while the app runs: install after it closes
+                    if not self._confirm(title="Install the NVIDIA models",
+                                         heading="Close the app to install?", body="", items=[],
+                                         detail="PyTorch has to be replaced with its GPU version (about 3 GB), "
+                                                "which can't happen while the app is using it. The app closes, a "
+                                                "window shows the install, and the app opens again when it's done.",
+                                         confirm="Close and install"):
+                        return
+                    if not self._edits_before_close():
+                        return
+                    if self.worker and self.worker.is_alive():
+                        self.status_var.set("Wait for the transcription to finish, then install.")
+                        return
+                    addons.install_after_close(plan)
+                    win.destroy()
+                    self.after(300, self._quit_for_update)
+                    return
+                from transcriber import setup_check
+                packages = ["transformers>=5.21"] + ([] if setup_check._has("torch") else ["torch"])
+                extra = ["--upgrade"]
             state.update(busy=True, cancel=False)
             if not log_box.winfo_ismapped():
                 log_box.pack(fill="x", before=buttons)
@@ -153,7 +178,11 @@ class SetupMixin:
                 from transcriber import addons
                 err, restart = None, False
                 try:
-                    if kind == "addon":
+                    if kind == "addon_nvidia":
+                        post(lambda: bar.configure(mode="indeterminate") or bar.start(12))
+                        addons.install_nvidia(lambda line: post(lambda line=line: add_log(line)),
+                                              lambda: state["cancel"])
+                    elif kind == "addon":
                         addons.install_speakers(
                             lambda line: post(lambda line=line: add_log(line)),
                             lambda f, t: post(lambda f=f, t=t: (bar.configure(value=f), step.configure(text=t))
@@ -163,7 +192,7 @@ class SetupMixin:
                         post(lambda: bar.configure(mode="indeterminate") or bar.start(12))
                         addons.pip_install(packages, lambda line: post(lambda line=line: add_log(line)),
                                            lambda: state["cancel"], extra)
-                        restart = c["key"] in ("vlc", "dnd", "theme", "gpu", "engine", "pillow")
+                        restart = c["key"] in ("vlc", "dnd", "theme", "gpu", "engine", "pillow", "nvidia")
                 except addons.Cancelled:
                     err = "cancelled"
                 except Exception as exc:

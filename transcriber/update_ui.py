@@ -160,5 +160,7 @@ class UpdateMixin:
             self.cancel_flag.set()
             self._save_settings_quietly()
             self.player.release()
+            from transcriber import crashlog
+            crashlog.stop()                  # an update, not a crash
         finally:
             self.destroy()

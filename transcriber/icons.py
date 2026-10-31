@@ -65,6 +65,24 @@ def icon_button(parent, root, name: str, tip: str, command) -> ttk.Button:
     return b
 
 
+def trash_image(color: str, scale: float = 1.0):
+    """A trash can drawn in `color` (for when the icon font isn't there)."""
+    from PIL import Image, ImageDraw, ImageTk
+    size, k = max(int(16 * scale), 14), 4
+    s = size * k
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    w = max(int(1.6 * k * scale), k)
+    d.line((s * 0.14, s * 0.24, s * 0.86, s * 0.24), fill=color, width=w)                     # lid
+    d.line((s * 0.38, s * 0.24, s * 0.40, s * 0.11, s * 0.60, s * 0.11, s * 0.62, s * 0.24), fill=color,
+           width=w, joint="curve")                                                         # handle
+    d.line((s * 0.22, s * 0.30, s * 0.28, s * 0.90, s * 0.72, s * 0.90, s * 0.78, s * 0.30), fill=color,
+           width=w, joint="curve")                                                         # can
+    for x in (0.41, 0.59):
+        d.line((s * x, s * 0.40, s * x, s * 0.78), fill=color, width=max(w - k // 2, k))
+    return ImageTk.PhotoImage(img.resize((size, size), Image.LANCZOS))
+
+
 def info_icon(parent, root, tip: str) -> ttk.Label:
     """A small (i) that explains something when you hover over it."""
     fam = icon_family(root)
@@ -75,7 +93,8 @@ def info_icon(parent, root, tip: str) -> ttk.Label:
 
 
 class Tooltip:
-    """Shows a small label under a widget after hovering for half a second."""
+    """Shows a small label under a widget after hovering for half a second (text: a string, or a
+    function giving it when shown)."""
 
     def __init__(self, widget, text: str, delay: int = 500):
         self.widget, self.text, self.delay = widget, text, delay
@@ -105,7 +124,7 @@ class Tooltip:
         self.tip = tk.Toplevel(self.widget)
         self.tip.overrideredirect(True)
         self.tip.configure(background=border, padx=1, pady=1)
-        tk.Label(self.tip, text=self.text, background=bg, foreground=fg, font=ui_font(9),
+        tk.Label(self.tip, text=self.text() if callable(self.text) else self.text, background=bg, foreground=fg, font=ui_font(9),
                  padx=8, pady=4, wraplength=280, justify="left").pack()
         self.tip.update_idletasks()
         x = self.widget.winfo_rootx() + (self.widget.winfo_width() - self.tip.winfo_reqwidth()) // 2

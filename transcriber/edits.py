@@ -34,11 +34,12 @@ def ensure_lines_file(files: dict) -> dict:
 
 def apply_text_edits(files: dict, edits: dict, people=None, deletes=(), times=None) -> None:
     """Save changes to one version: edits = {line index: new text}, deletes = line indexes to remove,
-    times = {line index: new start in seconds}. Lines are put back in time order in the master list,
-    then the .txt/.srt/.vtt and word timings are rebuilt to match."""
+    times = {line index: new start in seconds, or (start, end)}. Lines are put back in time order in
+    the master list, then the .txt/.srt/.vtt and word timings are rebuilt to match."""
     edits = {int(i): " ".join(str(t).split()) for i, t in edits.items()}
     deletes = {int(i) for i in deletes}
-    times = {int(i): max(float(t), 0.0) for i, t in (times or {}).items()}
+    times = {int(i): ((max(float(t[0]), 0.0), max(float(t[1]), float(t[0]) + 0.1)) if isinstance(t, (tuple, list))
+                      else max(float(t), 0.0)) for i, t in (times or {}).items()}
     files.update(ensure_lines_file(files))
     data = _read_lines(files)
     if data is None:
@@ -47,20 +48,44 @@ def apply_text_edits(files: dict, edits: dict, people=None, deletes=(), times=No
     for i, text in edits.items():
         if 0 <= i < len(segs):
             segs[i]["text"] = text
-    for i, start in times.items():
+    olds = {i: (float(segs[i]["start"]), float(segs[i]["end"])) for i in times if 0 <= i < len(segs)}
+    for i, t in times.items():
         if 0 <= i < len(segs):
-            length = max(float(segs[i]["end"]) - float(segs[i]["start"]), 0.5)
-            segs[i]["start"], segs[i]["end"] = round(start, 3), round(start + length, 3)
+            if isinstance(t, tuple):                     # a new start and end (the timeline)
+                segs[i]["start"], segs[i]["end"] = round(t[0], 3), round(t[1], 3)
+                segs[i]["fixed"] = True                  # captions keep exactly this time
+            else:                                        # a new start: the line keeps its length
+                length = max(float(segs[i]["end"]) - float(segs[i]["start"]), 0.5)
+                segs[i]["start"], segs[i]["end"] = round(t, 3), round(t + length, 3)
     starts = [float(x["start"]) for x in segs]
     kept = [(i, x) for i, x in enumerate(segs) if i not in deletes]
     data["segments"] = [x for _, x in sorted(kept, key=lambda p: (float(p[1]["start"]), p[0]))]
     _save_lines(files, data, people)
-    _update_words(files, edits, deletes, times, lambda i: (starts[i], i))
+    _update_words(files, edits, deletes, times, lambda i: (starts[i], i), olds)
 
 
-def split_line(files: dict, i: int, left: str, right: str, start: float, new_start: float, people=None) -> None:
-    """Split line i of a version into two: left text at `start`, right text at `new_start`.
-    The new line goes right after it (callers pick new_start so the order stays the same)."""
+def set_layers(files: dict, layers: dict, people=None) -> None:
+    """layers = {line index: 0, 1, 2 or None}: which caption spot each line was given by hand on the
+    timeline (None: back to automatic)."""
+    files.update(ensure_lines_file(files))
+    data = _read_lines(files)
+    if data is None:
+        return
+    segs = data["segments"]
+    for i, layer in layers.items():
+        if 0 <= i < len(segs):
+            if layer is None:
+                segs[i].pop("layer", None)
+            else:
+                segs[i]["layer"] = int(layer)
+    _save_lines(files, data, people)
+
+
+def split_line(files: dict, i: int, left: str, right: str, start: float, new_start: float, people=None,
+               end: Optional[float] = None) -> None:
+    """Split line i of a version into two: left text at `start`, right text at `new_start`
+    (ending at `end`, or where the line ended). The new line goes right after it (callers pick
+    new_start so the order stays the same)."""
     left, right = " ".join(left.split()), " ".join(right.split())
     files.update(ensure_lines_file(files))
     data = _read_lines(files)
@@ -68,18 +93,46 @@ def split_line(files: dict, i: int, left: str, right: str, start: float, new_sta
         return
     wp = files.get("words")
     lines = read_words(wp) if wp else None
+    seg = data["segments"][i]
     if lines is not None and 0 <= i < len(lines):
         ws = lines[i]
         n = len(left.split())
         fits = " ".join(w[2].strip() for w in ws) == " ".join((left + " " + right).split())
+        s0, e0 = float(seg["start"]), float(seg["end"])
+        shift = start - s0
+        if fits and end is not None and abs(shift) > 0.001 and abs((end - start) - (e0 - s0)) < 0.02:
+            ws = [[w[0] + shift, w[1] + shift] + list(w[2:]) for w in ws]     # the line had been moved
         lines[i:i + 1] = [ws[:n], ws[n:]] if fits else [[], []]
         write_words(wp, lines)
-    seg = data["segments"][i]
-    end = max(float(seg["end"]), new_start + 0.5)
+    end = max(float(seg["end"]) if end is None else float(end), new_start + (0.5 if end is None else 0.05))
     second = dict(seg, text=right, start=round(new_start, 3), end=round(end, 3))
     seg.update(text=left, start=round(start, 3), end=round(new_start, 3))
     data["segments"].insert(i + 1, second)
     _save_lines(files, data, people)
+
+
+def insert_line(files: dict, start: float, end: float, text: str, speaker: Optional[str] = None,
+                people=None) -> Optional[int]:
+    """Add a line (a pasted copy) at start..end, in time order. Returns its index. Its time was
+    placed by hand, so captions keep it exactly; it has no word timings of its own."""
+    files.update(ensure_lines_file(files))
+    data = _read_lines(files)
+    if data is None:
+        return None
+    segs = data["segments"]
+    i = next((k for k, x in enumerate(segs) if float(x["start"]) > start), len(segs))
+    seg = {"start": round(start, 3), "end": round(max(end, start + 0.2), 3), "text": " ".join(text.split()),
+           "speaker": speaker, "fixed": True}
+    segs.insert(i, seg)
+    wp = files.get("words")
+    lines = read_words(wp) if wp else None
+    if lines is not None:
+        while len(lines) < i:
+            lines.append([])
+        lines.insert(i, [])
+        write_words(wp, lines)
+    _save_lines(files, data, people)
+    return i
 
 
 def _read_lines(files: dict) -> Optional[dict]:
@@ -136,7 +189,11 @@ def rewrite_from_speakers(speakers_file, files: dict, people) -> None:
     data = read_speakers_file(speakers_file)
     if not data:
         return
-    segs = [Segment(x["start"], x["end"], x["text"]) for x in data["segments"]]
+    segs = [Segment(x["start"], x["end"], x["text"], fixed=bool(x.get("fixed")), layer=x.get("layer"))
+            for x in data["segments"]]
+    if files.get("words") and os.path.exists(files["words"]):      # captions are timed by the words
+        for sg, ws in zip(segs, read_words(files["words"]) or []):
+            sg.words = [tuple(w) for w in ws or []]
     t = Transcript(source=data.get("source", ""), model=data.get("model", ""), language=data.get("language", ""),
                    segments=segs, text=" ".join(x.text for x in segs), track=data.get("track", ""),
                    speakers=[x.get("speaker") for x in data["segments"]], names=display_names(data, people))

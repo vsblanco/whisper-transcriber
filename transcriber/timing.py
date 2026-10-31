@@ -138,3 +138,33 @@ def row_spans(segs, words) -> list:
         else:
             spans.append((float(sg.start), float(sg.end)))
     return spans
+
+
+# ---------------------------------------------------------------- scene cuts
+
+MAX_CUT_SCAN = 30 * 60      # longer stretches aren't scanned (it reads every frame of the video)
+_cut_cache: dict = {}
+
+
+def scene_cuts(path: str, a: float = 0.0, b: Optional[float] = None, threshold: float = 0.35) -> list:
+    """Times (seconds) of scene cuts in a video between a and b. [] for audio, or a stretch longer
+    than MAX_CUT_SCAN (too slow to read). Cached per file and stretch."""
+    import os
+    import re
+    import subprocess
+    from transcriber.core import _NO_WINDOW, has_video_stream, media_duration
+    if not path or not os.path.exists(path) or not has_video_stream(path):
+        return []
+    if b is None:
+        b = media_duration(path) or 0.0
+    if b - a > MAX_CUT_SCAN or b <= a:
+        return []
+    key = (path, os.path.getmtime(path), round(a, 1), round(b, 1))
+    if key in _cut_cache:
+        return _cut_cache[key]
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", path,
+           "-map", "0:v:0", "-an", "-vf", f"scale=192:-2,select='gt(scene,{threshold})',showinfo", "-f", "null", "-"]
+    r = subprocess.run(cmd, capture_output=True, text=True, creationflags=_NO_WINDOW)
+    cuts = sorted(a + float(t) for t in re.findall(r"pts_time:([0-9.]+)", r.stderr or ""))
+    _cut_cache[key] = cuts
+    return cuts
